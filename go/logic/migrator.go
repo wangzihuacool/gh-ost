@@ -398,7 +398,7 @@ func (this *Migrator) Migrate() (err error) {
 	if err := this.addDMLEventsListener(); err != nil {
 		return err
 	}
-	if err := this.applier.ReadMigrationRangeValues(); err != nil {
+	if err := this.retryOperation(this.applier.ReadMigrationRangeValues()); err != nil {
 		return err
 	}
 	if err := this.initiateThrottler(); err != nil {
