@@ -383,7 +383,7 @@ func buildUniqueKeyMinMaxValuesPreparedQuery(databaseName, tableName string, uni
 					%s.%s
 				order by
 					%s
-				limit 1
+				limit 1 lock in share mode
     `, databaseName, tableName, strings.Join(uniqueKeyColumnNames, ", "),
 		databaseName, tableName,
 		strings.Join(uniqueKeyColumnOrder, ", "),
