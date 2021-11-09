@@ -319,7 +319,7 @@ func TestBuildUniqueKeyMinValuesPreparedQuery(t *testing.T) {
 			    mydb.tbl
 			  order by
 			    name asc, position asc
-			  limit 1
+			  limit 1 lock in share mode
 		`
 		test.S(t).ExpectEquals(normalizeQuery(query), normalizeQuery(expected))
 	}
@@ -332,7 +332,7 @@ func TestBuildUniqueKeyMinValuesPreparedQuery(t *testing.T) {
 			    mydb.tbl
 			  order by
 			    name desc, position desc
-			  limit 1
+			  limit 1 lock in share mode
 		`
 		test.S(t).ExpectEquals(normalizeQuery(query), normalizeQuery(expected))
 	}
