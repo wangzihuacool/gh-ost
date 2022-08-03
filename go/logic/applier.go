@@ -1,5 +1,5 @@
 /*
-   Copyright 2021 GitHub Inc.
+   Copyright 2022 GitHub Inc.
 	 See https://github.com/github/gh-ost/blob/master/LICENSE
 */
 
@@ -22,7 +22,8 @@ import (
 )
 
 const (
-	atomicCutOverMagicHint = "ghost-cut-over-sentry"
+	GhostChangelogTableComment = "gh-ost changelog"
+	atomicCutOverMagicHint     = "ghost-cut-over-sentry"
 )
 
 type dmlBuildResult struct {
@@ -71,7 +72,6 @@ func NewApplier(migrationContext *base.MigrationContext) *Applier {
 }
 
 func (this *Applier) InitDBConnections() (err error) {
-
 	applierUri := this.connectionConfig.GetDBUri(this.migrationContext.DatabaseName)
 	if this.db, _, err = mysql.GetDB(this.migrationContext.Uuid, applierUri); err != nil {
 		return err
@@ -233,16 +233,16 @@ func (this *Applier) CreateChangelogTable() error {
 		return err
 	}
 	query := fmt.Sprintf(`create /* gh-ost */ table %s.%s (
-			id bigint auto_increment,
+			id bigint unsigned auto_increment,
 			last_update timestamp not null DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
 			hint varchar(64) charset ascii not null,
 			value varchar(4096) charset ascii not null,
 			primary key(id),
 			unique key hint_uidx(hint)
-		) auto_increment=256
-		`,
+		) auto_increment=256 comment='%s'`,
 		sql.EscapeName(this.migrationContext.DatabaseName),
 		sql.EscapeName(this.migrationContext.GetChangelogTableName()),
+		GhostChangelogTableComment,
 	)
 	this.migrationContext.Log.Infof("Creating changelog table %s.%s",
 		sql.EscapeName(this.migrationContext.DatabaseName),
@@ -344,8 +344,9 @@ func (this *Applier) InitiateHeartbeat() {
 	}
 	injectHeartbeat()
 
-	heartbeatTick := time.Tick(time.Duration(this.migrationContext.HeartbeatIntervalMilliseconds) * time.Millisecond)
-	for range heartbeatTick {
+	ticker := time.NewTicker(time.Duration(this.migrationContext.HeartbeatIntervalMilliseconds) * time.Millisecond)
+	defer ticker.Stop()
+	for range ticker.C {
 		if atomic.LoadInt64(&this.finishedMigrating) > 0 {
 			return
 		}
@@ -382,10 +383,13 @@ func (this *Applier) ReadMigrationMinValues(uniqueKey *sql.UniqueKey) error {
 	if err != nil {
 		return err
 	}
+
 	rows, err := this.db.Query(query)
 	if err != nil {
 		return err
 	}
+	defer rows.Close()
+
 	for rows.Next() {
 		this.migrationContext.MigrationRangeMinValues = sql.NewColumnValues(uniqueKey.Len())
 		if err = rows.Scan(this.migrationContext.MigrationRangeMinValues.ValuesPointers...); err != nil {
@@ -394,8 +398,7 @@ func (this *Applier) ReadMigrationMinValues(uniqueKey *sql.UniqueKey) error {
 	}
 	this.migrationContext.Log.Infof("Migration min values: [%s]", this.migrationContext.MigrationRangeMinValues)
 
-	err = rows.Err()
-	return err
+	return rows.Err()
 }
 
 // ReadMigrationMaxValues returns the maximum values to be iterated on rowcopy
@@ -405,10 +408,13 @@ func (this *Applier) ReadMigrationMaxValues(uniqueKey *sql.UniqueKey) error {
 	if err != nil {
 		return err
 	}
+
 	rows, err := this.db.Query(query)
 	if err != nil {
 		return err
 	}
+	defer rows.Close()
+
 	for rows.Next() {
 		this.migrationContext.MigrationRangeMaxValues = sql.NewColumnValues(uniqueKey.Len())
 		if err = rows.Scan(this.migrationContext.MigrationRangeMaxValues.ValuesPointers...); err != nil {
@@ -417,8 +423,7 @@ func (this *Applier) ReadMigrationMaxValues(uniqueKey *sql.UniqueKey) error {
 	}
 	this.migrationContext.Log.Infof("Migration max values: [%s]", this.migrationContext.MigrationRangeMaxValues)
 
-	err = rows.Err()
-	return err
+	return rows.Err()
 }
 
 // ReadMigrationRangeValues reads min/max values that will be used for rowcopy.
@@ -479,10 +484,13 @@ func (this *Applier) CalculateNextIterationRangeEndValues() (hasFurtherRange boo
 		if err != nil {
 			return hasFurtherRange, err
 		}
+
 		rows, err := this.db.Query(query, explodedArgs...)
 		if err != nil {
 			return hasFurtherRange, err
 		}
+		defer rows.Close()
+
 		iterationRangeMaxValues := sql.NewColumnValues(this.migrationContext.UniqueKey.Len())
 		for rows.Next() {
 			if err = rows.Scan(iterationRangeMaxValues.ValuesPointers...); err != nil {
@@ -1034,7 +1042,6 @@ func (this *Applier) buildDMLEventQuery(dmlEvent *binlog.BinlogDMLEvent) (result
 
 // ApplyDMLEventQueries applies multiple DML queries onto the _ghost_ table
 func (this *Applier) ApplyDMLEventQueries(dmlEvents [](*binlog.BinlogDMLEvent)) error {
-
 	var totalDelta int64
 
 	err := func() error {
