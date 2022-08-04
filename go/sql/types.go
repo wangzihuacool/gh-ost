@@ -45,10 +45,12 @@ type Column struct {
 	BinaryOctetLength uint
 }
 
+// convertArg 转换字符串到对应字符集，或者将二进制数据转换为对应的string，或者转换为对应的数字
 func (this *Column) convertArg(arg interface{}, isUniqueKeyColumn bool) interface{} {
 	if s, ok := arg.(string); ok {
 		// string, charset conversion
 		if encoding, ok := charsetEncodingMap[this.Charset]; ok {
+			// func (*Decoder) String 将指定的编码字符串转换为 UTF-8；它返回转换后的字符串或“”，如果发生任何错误，则返回错误。
 			arg, _ = encoding.NewDecoder().String(s)
 		}
 
@@ -268,6 +270,7 @@ type ColumnValues struct {
 	ValuesPointers []interface{}
 }
 
+// NewColumnValues 将abstractValues的值复制到ValuesPointers
 func NewColumnValues(length int) *ColumnValues {
 	result := &ColumnValues{
 		abstractValues: make([]interface{}, length),
@@ -296,9 +299,12 @@ func (this *ColumnValues) AbstractValues() []interface{} {
 	return this.abstractValues
 }
 
+// 返回二进制对应的ASCII字符串
 func (this *ColumnValues) StringColumn(index int) string {
 	val := this.AbstractValues()[index]
+	// uint8 the set of all unsigned  8-bit integers (0 to 255),等同于byte
 	if ints, ok := val.([]uint8); ok {
+		// string([]uint8) 返回byte对应的字符串
 		return string(ints)
 	}
 	return fmt.Sprintf("%+v", val)

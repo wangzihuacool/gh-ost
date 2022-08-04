@@ -21,6 +21,7 @@ const (
 	DeleteDML EventDML = "Delete"
 )
 
+// ToEventDML 判断binlog event entry 中的DML类型
 func ToEventDML(description string) EventDML {
 	// description can be a statement (`UPDATE my_table ...`) or a RBR event name (`UpdateRowsEventV2`)
 	description = strings.TrimSpace(strings.Split(description, " ")[0])
@@ -49,10 +50,13 @@ type BinlogDMLEvent struct {
 	DatabaseName      string
 	TableName         string
 	DML               EventDML
+	// WhereColumnValues 即binlog event中的前值
 	WhereColumnValues *sql.ColumnValues
+	// NewColumnValues 即binlog event中的后值
 	NewColumnValues   *sql.ColumnValues
 }
 
+// NewBinlogDMLEvent 构造一个BinlogDMLEvent结构体
 func NewBinlogDMLEvent(databaseName, tableName string, dml EventDML) *BinlogDMLEvent {
 	event := &BinlogDMLEvent{
 		DatabaseName: databaseName,
@@ -62,6 +66,7 @@ func NewBinlogDMLEvent(databaseName, tableName string, dml EventDML) *BinlogDMLE
 	return event
 }
 
+// String 返回BinlogDMLEvent结构体中的dml类型和库名、表名
 func (this *BinlogDMLEvent) String() string {
 	return fmt.Sprintf("[%+v on %s:%s]", this.DML, this.DatabaseName, this.TableName)
 }

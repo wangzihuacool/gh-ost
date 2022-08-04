@@ -1,5 +1,5 @@
 /*
-   Copyright 2022 GitHub Inc.
+   Copyright 2016 GitHub Inc.
 	 See https://github.com/github/gh-ost/blob/master/LICENSE
 */
 
@@ -17,18 +17,21 @@ import (
 	"github.com/github/gh-ost/go/logic"
 	"github.com/github/gh-ost/go/sql"
 	_ "github.com/go-sql-driver/mysql"
-	"github.com/openark/golib/log"
+	"github.com/outbrain/golib/log"
 
-	"golang.org/x/term"
+	"golang.org/x/crypto/ssh/terminal"
 )
 
 var AppVersion string
 
 // acceptSignals registers for OS signals
 func acceptSignals(migrationContext *base.MigrationContext) {
+	// 创建信用来接收os信号量，channel的缓存大小为1
 	c := make(chan os.Signal, 1)
 
+	// Notify函数将输入信号转发到c
 	signal.Notify(c, syscall.SIGHUP)
+	// 守护协程根据os信号,重新读取配置文件，刷新当前的iteration
 	go func() {
 		for sig := range c {
 			switch sig {
@@ -47,6 +50,13 @@ func acceptSignals(migrationContext *base.MigrationContext) {
 // main is the application's entry point. It will either spawn a CLI or HTTP interfaces.
 func main() {
 	migrationContext := base.NewMigrationContext()
+	// flag包提供了一系列解析命令行参数的功能接口,命令行对于一个或两个‘－’号，效果是一样的
+	// flag.xxxVar 将值存储到变量flagvar
+	// flag.StringVar(&flagvar, name:, value:, usage) - 存储字符类型变量到flagvar，命令行名称，默认值，使用说明
+	// flag.IntVar(&flagvar, name:, value: 0.0, usage) - 存储int类型变量到flagvar，命令行名称，默认值，使用说明
+	// flag.BoolVar(&flagvar, name:, value: false, usage) - 存储int类型变量到flagvar，命令行名称，默认值，使用说明
+
+	// flag.String(), flag.Bool(), flag.Int(), flag.Float64() 返回一个相应的指针
 	flag.StringVar(&migrationContext.InspectorConnectionConfig.Key.Hostname, "host", "127.0.0.1", "MySQL hostname (preferably a replica, not the master)")
 	flag.StringVar(&migrationContext.AssumeMasterHostname, "assume-master-host", "", "(optional) explicitly tell gh-ost the identity of the master. Format: some.host.com[:port] This is useful in master-master setups where you wish to pick an explicit master, or in a tungsten-replicator where gh-ost is unable to determine the master")
 	flag.IntVar(&migrationContext.InspectorConnectionConfig.Key.Port, "port", 3306, "MySQL port (preferably a replica, not the master)")
@@ -110,8 +120,6 @@ func main() {
 	throttleControlReplicas := flag.String("throttle-control-replicas", "", "List of replicas on which to check for lag; comma delimited. Example: myhost1.com:3306,myhost2.com,myhost3.com:3307")
 	throttleQuery := flag.String("throttle-query", "", "when given, issued (every second) to check if operation should throttle. Expecting to return zero for no-throttle, >0 for throttle. Query is issued on the migrated server. Make sure this query is lightweight")
 	throttleHTTP := flag.String("throttle-http", "", "when given, gh-ost checks given URL via HEAD request; any response code other than 200 (OK) causes throttling; make sure it has low latency response")
-	flag.Int64Var(&migrationContext.ThrottleHTTPIntervalMillis, "throttle-http-interval-millis", 100, "Number of milliseconds to wait before triggering another HTTP throttle check")
-	flag.Int64Var(&migrationContext.ThrottleHTTPTimeoutMillis, "throttle-http-timeout-millis", 1000, "Number of milliseconds to use as an HTTP throttle check timeout")
 	ignoreHTTPErrors := flag.Bool("ignore-http-errors", false, "ignore HTTP connection errors during throttle check")
 	heartbeatIntervalMillis := flag.Int64("heartbeat-interval-millis", 100, "how frequently would gh-ost inject a heartbeat value")
 	flag.StringVar(&migrationContext.ThrottleFlagFile, "throttle-flag-file", "", "operation pauses when this file exists; hint: use a file that is specific to the table being altered")
@@ -142,14 +150,19 @@ func main() {
 	help := flag.Bool("help", false, "Display usage")
 	version := flag.Bool("version", false, "Print version & exit")
 	checkFlag := flag.Bool("check-flag", false, "Check if another flag exists/supported. This allows for cross-version scripting. Exits with 0 when all additional provided flags exist, nonzero otherwise. You must provide (dummy) values for flags that require a value. Example: gh-ost --check-flag --cut-over-lock-timeout-seconds --nice-ratio 0")
+	// ForceTmpTableName 用来指定临时表表名，无论源表名是啥
 	flag.StringVar(&migrationContext.ForceTmpTableName, "force-table-names", "", "table name prefix to be used on the temporary tables")
+
+	// 设置flag的输出到Stdout
 	flag.CommandLine.SetOutput(os.Stdout)
 
+    // 解析命令行参数
 	flag.Parse()
 
 	if *checkFlag {
 		return
 	}
+	// flag.PrintDefaults()显示所有定义的命令行标志的默认设置的使用信息
 	if *help {
 		fmt.Fprintf(os.Stdout, "Usage of gh-ost:\n")
 		flag.PrintDefaults()
@@ -171,6 +184,7 @@ func main() {
 	if *debug {
 		migrationContext.Log.SetLevel(log.DEBUG)
 	}
+	// 打印堆栈信息
 	if *stack {
 		migrationContext.Log.SetPrintStackTrace(*stack)
 	}
@@ -182,9 +196,11 @@ func main() {
 	if migrationContext.AlterStatement == "" {
 		log.Fatalf("--alter must be provided and statement must not be empty")
 	}
+	// 解析ddl语句
 	parser := sql.NewParserFromAlterStatement(migrationContext.AlterStatement)
 	migrationContext.AlterStatementOptions = parser.GetAlterStatementOptions()
 
+	// databasename参数指定db_name，或者alter语句中指定
 	if migrationContext.DatabaseName == "" {
 		if parser.HasExplicitSchema() {
 			migrationContext.DatabaseName = parser.GetExplicitSchema()
@@ -193,10 +209,13 @@ func main() {
 		}
 	}
 
+	// QueryEscape函数对s进行转码使之可以安全的用在URL查询里。
+	// flag.Set() sets the value of the named command-line flag
 	if err := flag.Set("database", url.QueryEscape(migrationContext.DatabaseName)); err != nil {
 		migrationContext.Log.Fatale(err)
 	}
 
+	// tablename参数指定table_name，或者alter语句中指定
 	if migrationContext.OriginalTableName == "" {
 		if parser.HasExplicitTable() {
 			migrationContext.OriginalTableName = parser.GetExplicitTable()
@@ -204,6 +223,8 @@ func main() {
 			log.Fatalf("--table must be provided and table name must not be empty, or --alter must specify table name")
 		}
 	}
+
+	// ! - 逻辑运算符,非
 	migrationContext.Noop = !(*executeFlag)
 	if migrationContext.AllowedRunningOnMaster && migrationContext.TestOnReplica {
 		migrationContext.Log.Fatalf("--allow-on-master and --test-on-replica are mutually exclusive")
@@ -245,6 +266,7 @@ func main() {
 		migrationContext.Log.Warningf("--replication-lag-query is deprecated")
 	}
 
+	// custover的类型（atomic、two-step）
 	switch *cutOver {
 	case "atomic", "default", "":
 		migrationContext.CutOverType = base.CutOverAtomic
@@ -253,6 +275,7 @@ func main() {
 	default:
 		migrationContext.Log.Fatalf("Unknown cut-over: %s", *cutOver)
 	}
+
 	if err := migrationContext.ReadConfigFile(); err != nil {
 		migrationContext.Log.Fatale(err)
 	}
@@ -265,12 +288,13 @@ func main() {
 	if err := migrationContext.ReadCriticalLoad(*criticalLoad); err != nil {
 		migrationContext.Log.Fatale(err)
 	}
+	//fmt.Sprintf 格式化字符串;设置默认的serve-socket-file
 	if migrationContext.ServeSocketFile == "" {
 		migrationContext.ServeSocketFile = fmt.Sprintf("/tmp/gh-ost.%s.%s.sock", migrationContext.DatabaseName, migrationContext.OriginalTableName)
 	}
 	if *askPass {
 		fmt.Println("Password:")
-		bytePassword, err := term.ReadPassword(syscall.Stdin)
+		bytePassword, err := terminal.ReadPassword(int(syscall.Stdin))
 		if err != nil {
 			migrationContext.Log.Fatale(err)
 		}
@@ -285,10 +309,12 @@ func main() {
 	migrationContext.SetThrottleHTTP(*throttleHTTP)
 	migrationContext.SetIgnoreHTTPErrors(*ignoreHTTPErrors)
 	migrationContext.SetDefaultNumRetries(*defaultRetries)
+	// 配置文件和命令行参数生效顺序
 	migrationContext.ApplyCredentials()
 	if err := migrationContext.SetupTLS(); err != nil {
 		migrationContext.Log.Fatale(err)
 	}
+	// CutOver的timeout时间默认3s，范围：1-10
 	if err := migrationContext.SetCutOverLockTimeoutSeconds(*cutOverLockTimeoutSeconds); err != nil {
 		migrationContext.Log.Errore(err)
 	}
@@ -297,12 +323,18 @@ func main() {
 	}
 
 	log.Infof("starting gh-ost %+v", AppVersion)
+	// 协程，接收信号
 	acceptSignals(migrationContext)
 
-	migrator := logic.NewMigrator(migrationContext, AppVersion)
-	if err := migrator.Migrate(); err != nil {
+	// 初始化Migrator结构体
+	migrator := logic.NewMigrator(migrationContext)
+	// 调用Migrator结构体的Migrate()函数，运行
+	err := migrator.Migrate()
+	if err != nil {
 		migrator.ExecOnFailureHook()
 		migrationContext.Log.Fatale(err)
 	}
-	fmt.Fprintln(os.Stdout, "# Done")
+	// Fprintf：来格式化并输出到 io.Writers 而不是 os.Stdout。
+	//         fmt.Fprintf(os.Stderr, “an %s\n”, “error”)
+	fmt.Fprintf(os.Stdout, "# Done\n")
 }

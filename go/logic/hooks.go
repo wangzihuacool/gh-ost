@@ -1,5 +1,6 @@
 /*
-   Copyright 2022 GitHub Inc.
+/*
+   Copyright 2016 GitHub Inc.
 	 See https://github.com/github/gh-ost/blob/master/LICENSE
 */
 
@@ -13,7 +14,7 @@ import (
 	"sync/atomic"
 
 	"github.com/github/gh-ost/go/base"
-	"github.com/openark/golib/log"
+	"github.com/outbrain/golib/log"
 )
 
 const (
@@ -71,16 +72,19 @@ func (this *HooksExecutor) applyEnvironmentVariables(extraVariables ...string) [
 	env = append(env, fmt.Sprintf("GH_OST_HOOKS_HINT_TOKEN=%s", this.migrationContext.HooksHintToken))
 	env = append(env, fmt.Sprintf("GH_OST_DRY_RUN=%t", this.migrationContext.Noop))
 
-	env = append(env, extraVariables...)
+	for _, variable := range extraVariables {
+		env = append(env, variable)
+	}
 	return env
 }
 
 // executeHook executes a command, and sets relevant environment variables
 // combined output & error are printed to gh-ost's standard error.
 func (this *HooksExecutor) executeHook(hook string, extraVariables ...string) error {
+	// 通过 exec.Command 函数产生 Cmd 实例,该函数返回一个 *Cmd，用于使用给出的参数执行 name 指定的程序，需要调用start()或run()执行
 	cmd := exec.Command(hook)
 	cmd.Env = this.applyEnvironmentVariables(extraVariables...)
-
+    // Output() 是 Run() 的简便写法，外加获取外部命令的输出; 而 CombinedOutput更是Run()的简便写法，组合 Stdout 和 Stderr 的输出
 	combinedOutput, err := cmd.CombinedOutput()
 	fmt.Fprintln(os.Stderr, string(combinedOutput))
 	return log.Errore(err)
@@ -91,6 +95,7 @@ func (this *HooksExecutor) detectHooks(baseName string) (hooks []string, err err
 		return hooks, err
 	}
 	pattern := fmt.Sprintf("%s/%s*", this.migrationContext.HooksPath, baseName)
+	// Glob 函数返回所有匹配了模式字符串 pattern 的文件列表或者 nil（如果没有匹配的文件）
 	hooks, err = filepath.Glob(pattern)
 	return hooks, err
 }

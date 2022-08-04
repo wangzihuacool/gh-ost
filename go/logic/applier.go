@@ -1,5 +1,5 @@
 /*
-   Copyright 2022 GitHub Inc.
+   Copyright 2016 GitHub Inc.
 	 See https://github.com/github/gh-ost/blob/master/LICENSE
 */
 
@@ -8,7 +8,6 @@ package logic
 import (
 	gosql "database/sql"
 	"fmt"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -17,13 +16,12 @@ import (
 	"github.com/github/gh-ost/go/mysql"
 	"github.com/github/gh-ost/go/sql"
 
-	"github.com/openark/golib/log"
-	"github.com/openark/golib/sqlutils"
+	"github.com/outbrain/golib/sqlutils"
+	"sync"
 )
 
 const (
-	GhostChangelogTableComment = "gh-ost changelog"
-	atomicCutOverMagicHint     = "ghost-cut-over-sentry"
+	atomicCutOverMagicHint = "ghost-cut-over-sentry"
 )
 
 type dmlBuildResult struct {
@@ -71,6 +69,7 @@ func NewApplier(migrationContext *base.MigrationContext) *Applier {
 	}
 }
 
+// 初始化Applier的DB连接，一个this.db，一个this.singletonDB(singletonDB的最大连接数为1)
 func (this *Applier) InitDBConnections() (err error) {
 	applierUri := this.connectionConfig.GetDBUri(this.migrationContext.DatabaseName)
 	if this.db, _, err = mysql.GetDB(this.migrationContext.Uuid, applierUri); err != nil {
@@ -81,6 +80,7 @@ func (this *Applier) InitDBConnections() (err error) {
 		return err
 	}
 	this.singletonDB.SetMaxOpenConns(1)
+	// 校验db连接
 	version, err := base.ValidateConnection(this.db, this.connectionConfig, this.migrationContext, this.name)
 	if err != nil {
 		return err
@@ -89,6 +89,7 @@ func (this *Applier) InitDBConnections() (err error) {
 		return err
 	}
 	this.migrationContext.ApplierMySQLVersion = version
+	// 读取Applier的TimeZone
 	if err := this.validateAndReadTimeZone(); err != nil {
 		return err
 	}
@@ -99,6 +100,7 @@ func (this *Applier) InitDBConnections() (err error) {
 			this.connectionConfig.ImpliedKey = impliedKey
 		}
 	}
+	// readTableColumns 返回源表的字段列表给Applier
 	if err := this.readTableColumns(); err != nil {
 		return err
 	}
@@ -120,6 +122,7 @@ func (this *Applier) validateAndReadTimeZone() error {
 // readTableColumns reads table columns on applier
 func (this *Applier) readTableColumns() (err error) {
 	this.migrationContext.Log.Infof("Examining table structure on applier")
+	// GetTableColumns 返回字段列表 和 虚拟列的列表（这里忽略虚拟列）给到 Applier
 	this.migrationContext.OriginalTableColumnsOnApplier, _, err = mysql.GetTableColumns(this.db, this.migrationContext.DatabaseName, this.migrationContext.OriginalTableName)
 	if err != nil {
 		return err
@@ -233,16 +236,16 @@ func (this *Applier) CreateChangelogTable() error {
 		return err
 	}
 	query := fmt.Sprintf(`create /* gh-ost */ table %s.%s (
-			id bigint unsigned auto_increment,
+			id bigint auto_increment,
 			last_update timestamp not null DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
 			hint varchar(64) charset ascii not null,
 			value varchar(4096) charset ascii not null,
 			primary key(id),
 			unique key hint_uidx(hint)
-		) auto_increment=256 comment='%s'`,
+		) auto_increment=256
+		`,
 		sql.EscapeName(this.migrationContext.DatabaseName),
 		sql.EscapeName(this.migrationContext.GetChangelogTableName()),
-		GhostChangelogTableComment,
 	)
 	this.migrationContext.Log.Infof("Creating changelog table %s.%s",
 		sql.EscapeName(this.migrationContext.DatabaseName),
@@ -328,10 +331,12 @@ func (this *Applier) WriteChangelogState(value string) (string, error) {
 // This is done asynchronously
 func (this *Applier) InitiateHeartbeat() {
 	var numSuccessiveFailures int64
+	// 定义个injectHeartbeat函数
 	injectHeartbeat := func() error {
 		if atomic.LoadInt64(&this.migrationContext.HibernateUntil) > 0 {
 			return nil
 		}
+		// 连续写入heartbeat到心跳表失败次数超过defaultretries(即60次)则报错退出
 		if _, err := this.WriteChangelog("heartbeat", time.Now().Format(time.RFC3339Nano)); err != nil {
 			numSuccessiveFailures++
 			if numSuccessiveFailures > this.migrationContext.MaxRetries() {
@@ -342,17 +347,23 @@ func (this *Applier) InitiateHeartbeat() {
 		}
 		return nil
 	}
+	// 写入心跳到心跳表
 	injectHeartbeat()
+    // time.Tick() 函数声明为 Tick(d Duration) <-chan Time
+	// 在 golang 中，After(d) 是只等待一次 d 的时长，并在这次等待结束后将当前时间发送到通道。Tick(d) 则是间隔地多次等待，每次等待 d 时长，并在每次间隔结束的时候将当前时间发送到通道。
+	// 因为 Tick() 也是在等待结束的时候发送数据到通道，所以它的返回值是一个 channel，从这个 channel 中可读取每次等待完时的时间点。
+	heartbeatTick := time.Tick(time.Duration(this.migrationContext.HeartbeatIntervalMilliseconds) * time.Millisecond)
 
-	ticker := time.NewTicker(time.Duration(this.migrationContext.HeartbeatIntervalMilliseconds) * time.Millisecond)
-	defer ticker.Stop()
-	for range ticker.C {
+	// 每隔heartbearTick时间间隔，写入心跳表
+	// 这里heartbeatTick是channel，每隔指定时间将当前时间写入channel，for range heartbeatTick 判断channel不为空则执行
+	for range heartbeatTick {
 		if atomic.LoadInt64(&this.finishedMigrating) > 0 {
 			return
 		}
 		// Generally speaking, we would issue a goroutine, but I'd actually rather
 		// have this block the loop rather than spam the master in the event something
 		// goes wrong
+		// 如果限流，则不写心跳表，准确来说啥也不干
 		if throttle, _, reasonHint := this.migrationContext.IsThrottled(); throttle && (reasonHint == base.UserCommandThrottleReasonHint) {
 			continue
 		}
@@ -379,78 +390,62 @@ func (this *Applier) ExecuteThrottleQuery() (int64, error) {
 // ReadMigrationMinValues returns the minimum values to be iterated on rowcopy
 func (this *Applier) ReadMigrationMinValues(uniqueKey *sql.UniqueKey) error {
 	this.migrationContext.Log.Debugf("Reading migration range according to key: %s", uniqueKey.Name)
+    // 构造获取唯一键最小值的SQL
 	query, err := sql.BuildUniqueKeyMinValuesPreparedQuery(this.migrationContext.DatabaseName, this.migrationContext.OriginalTableName, &uniqueKey.Columns)
 	if err != nil {
 		return err
 	}
-
 	rows, err := this.db.Query(query)
 	if err != nil {
 		return err
 	}
-	defer rows.Close()
-
 	for rows.Next() {
+		// MigrationRangeMinValue 为 ColumnValues结构体
 		this.migrationContext.MigrationRangeMinValues = sql.NewColumnValues(uniqueKey.Len())
+		// SQL查询结构赋值给MigrationRangeMinValues
 		if err = rows.Scan(this.migrationContext.MigrationRangeMinValues.ValuesPointers...); err != nil {
 			return err
 		}
 	}
 	this.migrationContext.Log.Infof("Migration min values: [%s]", this.migrationContext.MigrationRangeMinValues)
 
-	return rows.Err()
+	err = rows.Err()
+	return err
 }
 
 // ReadMigrationMaxValues returns the maximum values to be iterated on rowcopy
 func (this *Applier) ReadMigrationMaxValues(uniqueKey *sql.UniqueKey) error {
 	this.migrationContext.Log.Debugf("Reading migration range according to key: %s", uniqueKey.Name)
+	// 构造获取唯一键最大值的SQL
 	query, err := sql.BuildUniqueKeyMaxValuesPreparedQuery(this.migrationContext.DatabaseName, this.migrationContext.OriginalTableName, &uniqueKey.Columns)
 	if err != nil {
 		return err
 	}
-
 	rows, err := this.db.Query(query)
 	if err != nil {
 		return err
 	}
-	defer rows.Close()
-
 	for rows.Next() {
+		// MigrationRangeMinValue 为 ColumnValues结构体
 		this.migrationContext.MigrationRangeMaxValues = sql.NewColumnValues(uniqueKey.Len())
+		// SQL查询结构赋值给MigrationRangeMaxValues
 		if err = rows.Scan(this.migrationContext.MigrationRangeMaxValues.ValuesPointers...); err != nil {
 			return err
 		}
 	}
 	this.migrationContext.Log.Infof("Migration max values: [%s]", this.migrationContext.MigrationRangeMaxValues)
 
-	return rows.Err()
+	err = rows.Err()
+	return err
 }
 
-// ReadMigrationRangeValues reads min/max values that will be used for rowcopy.
-// Before read min/max, write a changelog state into the ghc table to avoid lost data in mysql two-phase commit.
-/*
-Detail description of the lost data in mysql two-phase commit issue by @Fanduzi:
-	When using semi-sync and setting rpl_semi_sync_master_wait_point=AFTER_SYNC,
-	if an INSERT statement is being committed but blocks due to an unmet ack count,
-	the data inserted by the transaction is not visible to ReadMigrationRangeValues,
-	so the copy of the existing data in the table does not include the new row inserted by the transaction.
-	However, the binlog event for the transaction is already written to the binlog,
-	so the addDMLEventsListener only captures the binlog event after the transaction,
-	and thus the transaction's binlog event is not captured, resulting in data loss.
-
-	If write a changelog into ghc table before ReadMigrationRangeValues, and the transaction commit blocks
-	because the ack is not met, then the changelog will not be able to write, so the ReadMigrationRangeValues
-	will not be run. When the changelog writes successfully, the ReadMigrationRangeValues will read the
-	newly inserted data, thus Avoiding data loss due to the above problem.
-*/
+// ReadMigrationRangeValues reads min/max values that will be used for rowcopy
 func (this *Applier) ReadMigrationRangeValues() error {
-	if _, err := this.WriteChangelogState(string(ReadMigrationRangeValues)); err != nil {
-		return err
-	}
-
+	// ReadMigrationMinValues 获取唯一键最小值
 	if err := this.ReadMigrationMinValues(this.migrationContext.UniqueKey); err != nil {
 		return err
 	}
+	// ReadMigrationMaxValues 获取唯一键最大值
 	if err := this.ReadMigrationMaxValues(this.migrationContext.UniqueKey); err != nil {
 		return err
 	}
@@ -461,14 +456,17 @@ func (this *Applier) ReadMigrationRangeValues() error {
 // which will be used for copying the next chunk of rows. Ir returns "false" if there is
 // no further chunk to work through, i.e. we're past the last chunk and are done with
 // iterating the range (and this done with copying row chunks)
+// CalculateNextIterationRangeEndValues 计算下一批次拷贝的起始值
 func (this *Applier) CalculateNextIterationRangeEndValues() (hasFurtherRange bool, err error) {
 	this.migrationContext.MigrationIterationRangeMinValues = this.migrationContext.MigrationIterationRangeMaxValues
 	if this.migrationContext.MigrationIterationRangeMinValues == nil {
 		this.migrationContext.MigrationIterationRangeMinValues = this.migrationContext.MigrationRangeMinValues
 	}
 	for i := 0; i < 2; i++ {
+		// 构造分批范围的分批下限值查询SQL
 		buildFunc := sql.BuildUniqueKeyRangeEndPreparedQueryViaOffset
 		if i == 1 {
+			// BuildUniqueKeyRangeEndPreparedQueryViaTemptable 构造分批范围的分批下限值查询SQL，与BuildUniqueKeyRangeEndPreparedQueryViaOffset稍有差异
 			buildFunc = sql.BuildUniqueKeyRangeEndPreparedQueryViaTemptable
 		}
 		query, explodedArgs, err := buildFunc(
@@ -484,15 +482,18 @@ func (this *Applier) CalculateNextIterationRangeEndValues() (hasFurtherRange boo
 		if err != nil {
 			return hasFurtherRange, err
 		}
-
+		// 实际执行查询
 		rows, err := this.db.Query(query, explodedArgs...)
 		if err != nil {
 			return hasFurtherRange, err
 		}
-		defer rows.Close()
-
+		// NewColumnValues 将ColumnValues结构体的abstractValues的值复制到ValuesPointers
 		iterationRangeMaxValues := sql.NewColumnValues(this.migrationContext.UniqueKey.Len())
+		// rows.Next() 遍历读取结果期，使用rows.Scan()将结果集存到变量。
+		// 结果集(rows)未关闭前，底层的连接处于繁忙状态。当遍历读到最后一条记录时，会发生一个内部EOF错误，自动调用rows.Close()。
+		// 但是如果提前退出循环，rows不会关闭，连接不会回到连接池中，连接也不会关闭。所以手动关闭非常重要。rows.Close()可以多次调用，是无害操作。
 		for rows.Next() {
+			// Scan()函数将查询结果赋值给iterationRangeMaxValues.ValuesPointers...
 			if err = rows.Scan(iterationRangeMaxValues.ValuesPointers...); err != nil {
 				return hasFurtherRange, err
 			}
@@ -501,6 +502,7 @@ func (this *Applier) CalculateNextIterationRangeEndValues() (hasFurtherRange boo
 		if err = rows.Err(); err != nil {
 			return hasFurtherRange, err
 		}
+		// 如果还有下一批次结果，将当前查询结果赋值给context的 MigrationIterationRangeMaxValues
 		if hasFurtherRange {
 			this.migrationContext.MigrationIterationRangeMaxValues = iterationRangeMaxValues
 			return hasFurtherRange, nil
@@ -512,10 +514,18 @@ func (this *Applier) CalculateNextIterationRangeEndValues() (hasFurtherRange boo
 
 // ApplyIterationInsertQuery issues a chunk-INSERT query on the ghost table. It is where
 // data actually gets copied from original table.
+// ApplyIterationInsertQuery 拷贝单个批次的数据到_gho表，返回分批大小、插入行数、SQL执行时间
 func (this *Applier) ApplyIterationInsertQuery() (chunkSize int64, rowsAffected int64, duration time.Duration, err error) {
 	startTime := time.Now()
+	// 获取context的chunkSize配置，即一个批次拷贝多少条记录
 	chunkSize = atomic.LoadInt64(&this.migrationContext.ChunkSize)
 
+	// BuildRangeInsertPreparedQuery 返回分批插入_gho表的插入SQL，这里分批范围是 (rangeMin, rangeMax] ，第一批是 [rangeMin, rangeMax]
+	// 最终SQL类似：insert /* gh-ost db.tab1 */ ignore into db._gho (mappedSharedCol1, mappedSharedCol2, mappedSharedCol3)
+	//      (select sharedCol1, sharedCol2, sharedCol3 from db.tab1 force index (UniqKeyName)
+	//        where (((col1 > ?) or ((col1 = ?) and (col2 > ?)) or (((col1 = ?) and (col2 = ?)) and (col3 > ?)))
+	//	        and ((col1 < ?) or ((col1 = ?) and (col2 < ?)) or (((col1 = ?) and (col2 = ?)) and (col3 < ?)) or ((col1 = ?) and (col2 = ?) and (col3 = ?))))
+	//        lock in share mode)
 	query, explodedArgs, err := sql.BuildRangeInsertPreparedQuery(
 		this.migrationContext.DatabaseName,
 		this.migrationContext.OriginalTableName,
@@ -527,18 +537,21 @@ func (this *Applier) ApplyIterationInsertQuery() (chunkSize int64, rowsAffected 
 		this.migrationContext.MigrationIterationRangeMinValues.AbstractValues(),
 		this.migrationContext.MigrationIterationRangeMaxValues.AbstractValues(),
 		this.migrationContext.GetIteration() == 0,
+		// IsTransactionalTable() 判定表存储引擎是否事务性
 		this.migrationContext.IsTransactionalTable(),
 	)
 	if err != nil {
 		return chunkSize, rowsAffected, duration, err
 	}
 
+	// 实际执行分批插入SQL
 	sqlResult, err := func() (gosql.Result, error) {
 		tx, err := this.db.Begin()
 		if err != nil {
 			return nil, err
 		}
 		defer tx.Rollback()
+		// rowCopy时设置时区为目标库的time_zone，加上NO_AUTO_VALUE_ON_ZERO，和不显式指定时加上STRICT_ALL_TABLES
 		sessionQuery := fmt.Sprintf(`SET SESSION time_zone = '%s'`, this.migrationContext.ApplierTimeZone)
 		sqlModeAddendum := `,NO_AUTO_VALUE_ON_ZERO`
 		if !this.migrationContext.SkipStrictMode {
@@ -546,6 +559,7 @@ func (this *Applier) ApplyIterationInsertQuery() (chunkSize int64, rowsAffected 
 		}
 		sessionQuery = fmt.Sprintf("%s, sql_mode = CONCAT(@@session.sql_mode, ',%s')", sessionQuery, sqlModeAddendum)
 
+		// rowCopy实际执行插入SQL(insert into ... select)
 		if _, err := tx.Exec(sessionQuery); err != nil {
 			return nil, err
 		}
@@ -562,6 +576,7 @@ func (this *Applier) ApplyIterationInsertQuery() (chunkSize int64, rowsAffected 
 	if err != nil {
 		return chunkSize, rowsAffected, duration, err
 	}
+	// 获取返回行数和SQL执行时间，debug日志中记录批次最小值、批次最大值、批次、分批大小
 	rowsAffected, _ = sqlResult.RowsAffected()
 	duration = time.Since(startTime)
 	this.migrationContext.Log.Debugf(
@@ -729,7 +744,7 @@ func (this *Applier) StopReplication() error {
 	if err := this.StopSlaveSQLThread(); err != nil {
 		return err
 	}
-
+    // GetReplicationBinlogCoordinates 获取slave当前读取和回放的点位
 	readBinlogCoordinates, executeBinlogCoordinates, err := mysql.GetReplicationBinlogCoordinates(this.db)
 	if err != nil {
 		return err
@@ -751,6 +766,7 @@ func (this *Applier) StartReplication() error {
 }
 
 // GetSessionLockName returns a name for the special hint session voluntary lock
+// GetSessionLockName 返回与会话ID关联的指定锁名 "gh-ost.SessionId.lock"
 func (this *Applier) GetSessionLockName(sessionId int64) string {
 	return fmt.Sprintf("gh-ost.%d.lock", sessionId)
 }
@@ -794,28 +810,35 @@ func (this *Applier) ExpectProcess(sessionId int64, stateHint, infoHint string) 
 
 // DropAtomicCutOverSentryTableIfExists checks if the "old" table name
 // happens to be a cut-over magic table; if so, it drops it.
+// DropAtomicCutOverSentryTableIfExists 检查_del后缀的临时表是否已存在，如果存在则drop该表
 func (this *Applier) DropAtomicCutOverSentryTableIfExists() error {
 	this.migrationContext.Log.Infof("Looking for magic cut-over table")
+	// 返回old临时表，命名方式为：_TABLE_del
 	tableName := this.migrationContext.GetOldTableName()
+	// 查看 "show table status like `_TABLE_del`" 结果，如果结果不存在则返回空
 	rowMap := this.showTableStatus(tableName)
 	if rowMap == nil {
 		// Table does not exist
 		return nil
 	}
+	// 如果返回结果不为空，并且Comment值不是"ghost-cut-over-sentry"，则返回err
 	if rowMap["Comment"].String != atomicCutOverMagicHint {
 		return fmt.Errorf("Expected magic comment on %s, did not find it", tableName)
 	}
+	// 如果返回结果不为空，并且Comment是"ghost-cut-over-sentry"，则drop该表
 	this.migrationContext.Log.Infof("Dropping magic cut-over table")
 	return this.dropTable(tableName)
 }
 
-// CreateAtomicCutOverSentryTable
+// CreateAtomicCutOverSentryTable 创建_del后缀的哨兵表
 func (this *Applier) CreateAtomicCutOverSentryTable() error {
+	// 判断如果_del后缀的哨兵表存在，则删除该表
 	if err := this.DropAtomicCutOverSentryTableIfExists(); err != nil {
 		return err
 	}
 	tableName := this.migrationContext.GetOldTableName()
 
+	// 创建_del后缀的哨兵表
 	query := fmt.Sprintf(`create /* gh-ost */ table %s.%s (
 			id int auto_increment primary key
 		) engine=%s comment='%s'
@@ -837,7 +860,7 @@ func (this *Applier) CreateAtomicCutOverSentryTable() error {
 	return nil
 }
 
-// AtomicCutOverMagicLock
+// AtomicCutOverMagicLock 锁表(源表和哨兵表)
 func (this *Applier) AtomicCutOverMagicLock(sessionIdChan chan int64, tableLocked chan<- error, okToUnlockTable <-chan bool, tableUnlocked chan<- error, dropCutOverSentryTableOnce *sync.Once) error {
 	tx, err := this.db.Begin()
 	if err != nil {
@@ -851,6 +874,7 @@ func (this *Applier) AtomicCutOverMagicLock(sessionIdChan chan int64, tableLocke
 		tx.Rollback()
 	}()
 
+	// 获取当前DB连接的会话ID，并把会话ID入信道sessionIdChan
 	var sessionId int64
 	if err := tx.QueryRow(`select connection_id()`).Scan(&sessionId); err != nil {
 		tableLocked <- err
@@ -858,8 +882,11 @@ func (this *Applier) AtomicCutOverMagicLock(sessionIdChan chan int64, tableLocke
 	}
 	sessionIdChan <- sessionId
 
+	// 使用MySQL的get_lock(str, 0)函数获取指定名称str的锁
+	// (常用于应用程序锁，使用release_lock(str)来获取，在metadata_lock中标记类型为USER LEVEL LOCK)
 	lockResult := 0
 	query := `select get_lock(?, 0)`
+	// GetSessionLockName 返回与会话ID关联的指定锁名 "gh-ost.SessionId.lock"
 	lockName := this.GetSessionLockName(sessionId)
 	this.migrationContext.Log.Infof("Grabbing voluntary lock: %s", lockName)
 	if err := tx.QueryRow(query, lockName).Scan(&lockResult); err != nil || lockResult != 1 {
@@ -868,6 +895,7 @@ func (this *Applier) AtomicCutOverMagicLock(sessionIdChan chan int64, tableLocke
 		return err
 	}
 
+	// 设置MySQL会话级lock_wait_timeout时间为CutOverLockTimeoutSeconds参数的2倍
 	tableLockTimeoutSeconds := this.migrationContext.CutOverLockTimeoutSeconds * 2
 	this.migrationContext.Log.Infof("Setting LOCK timeout as %d seconds", tableLockTimeoutSeconds)
 	query = fmt.Sprintf(`set session lock_wait_timeout:=%d`, tableLockTimeoutSeconds)
@@ -876,11 +904,14 @@ func (this *Applier) AtomicCutOverMagicLock(sessionIdChan chan int64, tableLocke
 		return err
 	}
 
+	// CreateAtomicCutOverSentryTable 创建_del后缀的哨兵表
 	if err := this.CreateAtomicCutOverSentryTable(); err != nil {
 		tableLocked <- err
 		return err
 	}
 
+	// lock tables TABLE write, _TABLE_del write
+	// 同时持有源表和哨兵表的写锁，阻塞rename操作和业务读写操作
 	query = fmt.Sprintf(`lock /* gh-ost */ tables %s.%s write, %s.%s write`,
 		sql.EscapeName(this.migrationContext.DatabaseName),
 		sql.EscapeName(this.migrationContext.OriginalTableName),
@@ -899,6 +930,7 @@ func (this *Applier) AtomicCutOverMagicLock(sessionIdChan chan int64, tableLocke
 		return err
 	}
 	this.migrationContext.Log.Infof("Tables locked")
+	// 空值入信道tableLocked
 	tableLocked <- nil // No error.
 
 	// From this point on, we are committed to UNLOCK TABLES. No matter what happens,
@@ -906,11 +938,14 @@ func (this *Applier) AtomicCutOverMagicLock(sessionIdChan chan int64, tableLocke
 
 	// The cut-over phase will proceed to apply remaining backlog onto ghost table,
 	// and issue RENAME. We wait here until told to proceed.
+
+	// 阻塞，直到okToUnlockTable信道获取到消息
 	<-okToUnlockTable
 	this.migrationContext.Log.Infof("Will now proceed to drop magic table and unlock tables")
 
 	// The magic table is here because we locked it. And we are the only ones allowed to drop it.
 	// And in fact, we will:
+	// 删除_del后缀的哨兵表
 	this.migrationContext.Log.Infof("Dropping magic cut-over table")
 	query = fmt.Sprintf(`drop /* gh-ost */ table if exists %s.%s`,
 		sql.EscapeName(this.migrationContext.DatabaseName),
@@ -925,6 +960,7 @@ func (this *Applier) AtomicCutOverMagicLock(sessionIdChan chan int64, tableLocke
 	})
 
 	// Tables still locked
+	// 释放源表的锁
 	this.migrationContext.Log.Infof("Releasing lock from %s.%s, %s.%s",
 		sql.EscapeName(this.migrationContext.DatabaseName),
 		sql.EscapeName(this.migrationContext.OriginalTableName),
@@ -941,17 +977,19 @@ func (this *Applier) AtomicCutOverMagicLock(sessionIdChan chan int64, tableLocke
 	return nil
 }
 
-// AtomicCutoverRename
+// AtomicCutoverRename 重命名源表和影子表
 func (this *Applier) AtomicCutoverRename(sessionIdChan chan int64, tablesRenamed chan<- error) error {
 	tx, err := this.db.Begin()
 	if err != nil {
 		return err
 	}
+	// 函数退出时回滚
 	defer func() {
 		tx.Rollback()
 		sessionIdChan <- -1
 		tablesRenamed <- fmt.Errorf("Unexpected error in AtomicCutoverRename(), injected to release blocking channel reads")
 	}()
+	// 获取rename表的sessionID
 	var sessionId int64
 	if err := tx.QueryRow(`select connection_id()`).Scan(&sessionId); err != nil {
 		return err
@@ -964,6 +1002,7 @@ func (this *Applier) AtomicCutoverRename(sessionIdChan chan int64, tablesRenamed
 		return err
 	}
 
+	// 重命名源表和影子表
 	query = fmt.Sprintf(`rename /* gh-ost */ table %s.%s to %s.%s, %s.%s to %s.%s`,
 		sql.EscapeName(this.migrationContext.DatabaseName),
 		sql.EscapeName(this.migrationContext.OriginalTableName),
@@ -984,6 +1023,7 @@ func (this *Applier) AtomicCutoverRename(sessionIdChan chan int64, tablesRenamed
 	return nil
 }
 
+// ShowStatusVariable 获取status状态值
 func (this *Applier) ShowStatusVariable(variableName string) (result int64, err error) {
 	query := fmt.Sprintf(`show global status like '%s'`, variableName)
 	if err := this.db.QueryRow(query).Scan(&variableName, &result); err != nil {
@@ -997,9 +1037,12 @@ func (this *Applier) ShowStatusVariable(variableName string) (result int64, err 
 // for special handling.
 func (this *Applier) updateModifiesUniqueKeyColumns(dmlEvent *binlog.BinlogDMLEvent) (modifiedColumn string, isModified bool) {
 	for _, column := range this.migrationContext.UniqueKey.Columns.Columns() {
+		// 列顺序
 		tableOrdinal := this.migrationContext.OriginalTableColumns.Ordinals[column.Name]
+		// dmlEvent中的前值和后值
 		whereColumnValue := dmlEvent.WhereColumnValues.AbstractValues()[tableOrdinal]
 		newColumnValue := dmlEvent.NewColumnValues.AbstractValues()[tableOrdinal]
+		// 返回更新的唯一键中的列
 		if newColumnValue != whereColumnValue {
 			return column.Name, true
 		}
@@ -1009,20 +1052,32 @@ func (this *Applier) updateModifiesUniqueKeyColumns(dmlEvent *binlog.BinlogDMLEv
 
 // buildDMLEventQuery creates a query to operate on the ghost table, based on an intercepted binlog
 // event entry on the original table.
+// buildDMLEventQuery 根据event entry在_gho表上构造相应的回放SQL
 func (this *Applier) buildDMLEventQuery(dmlEvent *binlog.BinlogDMLEvent) (results [](*dmlBuildResult)) {
+	// dmlEvent *binlog.BinlogDMLEvent is a binary log rows (DML) event entry, with data.
+	// dmlEvent.DML代表DML的类型
+	// 针对不同的DML类型构造响应的回放SQL
 	switch dmlEvent.DML {
+	// delete语句
 	case binlog.DeleteDML:
 		{
+		    // BuildDMLDeleteQuery 构造delete语句在_gho表上的回放SQL，仅使用唯一键做条件 (delete回放时仍然是delete)
 			query, uniqueKeyArgs, err := sql.BuildDMLDeleteQuery(dmlEvent.DatabaseName, this.migrationContext.GetGhostTableName(), this.migrationContext.OriginalTableColumns, &this.migrationContext.UniqueKey.Columns, dmlEvent.WhereColumnValues.AbstractValues())
+			// 为results的slice添加一个dmlBuildResult的结构体，结构体内容就是一个prepared的delete语句，影子表记录数-1(统计用)
 			return append(results, newDmlBuildResult(query, uniqueKeyArgs, -1, err))
 		}
+	// insert语句
 	case binlog.InsertDML:
 		{
+			// BuildDMLInsertQuery 构造insert语句在_gho表上的回放SQL (insert回放时改成replace)
 			query, sharedArgs, err := sql.BuildDMLInsertQuery(dmlEvent.DatabaseName, this.migrationContext.GetGhostTableName(), this.migrationContext.OriginalTableColumns, this.migrationContext.SharedColumns, this.migrationContext.MappedSharedColumns, dmlEvent.NewColumnValues.AbstractValues())
+			// 为results的slice添加一个dmlBuildResult的结构体，结构体内容就是一个prepared的replace语句，影子表记录数+1(统计用)
 			return append(results, newDmlBuildResult(query, sharedArgs, 1, err))
 		}
+	// update语句
 	case binlog.UpdateDML:
 		{
+		    // 判断唯一键中的列是否被更新；如果更新了唯一键，则将update语句拆分成根据唯一键先delete后insert
 			if _, isModified := this.updateModifiesUniqueKeyColumns(dmlEvent); isModified {
 				dmlEvent.DML = binlog.DeleteDML
 				results = append(results, this.buildDMLEventQuery(dmlEvent)...)
@@ -1030,10 +1085,12 @@ func (this *Applier) buildDMLEventQuery(dmlEvent *binlog.BinlogDMLEvent) (result
 				results = append(results, this.buildDMLEventQuery(dmlEvent)...)
 				return results
 			}
+			// 如果没有更新唯一键，则使用BuildDMLUpdateQuery构造update语句在_gho表上的回放SQL
 			query, sharedArgs, uniqueKeyArgs, err := sql.BuildDMLUpdateQuery(dmlEvent.DatabaseName, this.migrationContext.GetGhostTableName(), this.migrationContext.OriginalTableColumns, this.migrationContext.SharedColumns, this.migrationContext.MappedSharedColumns, &this.migrationContext.UniqueKey.Columns, dmlEvent.NewColumnValues.AbstractValues(), dmlEvent.WhereColumnValues.AbstractValues())
 			args := sqlutils.Args()
 			args = append(args, sharedArgs...)
 			args = append(args, uniqueKeyArgs...)
+			// 为results的slice添加一个dmlBuildResult的结构体，结构体内容就是一个prepared的update语句，影子表记录数+0(统计用)
 			return append(results, newDmlBuildResult(query, args, 0, err))
 		}
 	}
@@ -1042,8 +1099,9 @@ func (this *Applier) buildDMLEventQuery(dmlEvent *binlog.BinlogDMLEvent) (result
 
 // ApplyDMLEventQueries applies multiple DML queries onto the _ghost_ table
 func (this *Applier) ApplyDMLEventQueries(dmlEvents [](*binlog.BinlogDMLEvent)) error {
-	var totalDelta int64
 
+	var totalDelta int64
+    // 开启一个事务批量应用DmlEvents
 	err := func() error {
 		tx, err := this.db.Begin()
 		if err != nil {
@@ -1055,38 +1113,36 @@ func (this *Applier) ApplyDMLEventQueries(dmlEvents [](*binlog.BinlogDMLEvent)) 
 			return err
 		}
 
+		// 设置time_zone到+00:00
 		sessionQuery := "SET SESSION time_zone = '+00:00'"
-
+        // SQL_MODE加上 NO_AUTO_VALUE_ON_ZERO
 		sqlModeAddendum := `,NO_AUTO_VALUE_ON_ZERO`
+		// 默认情况下，SQL_MODE使用STRICT_ALL_TABLES严格模式
 		if !this.migrationContext.SkipStrictMode {
 			sqlModeAddendum = fmt.Sprintf("%s,STRICT_ALL_TABLES", sqlModeAddendum)
 		}
+		// 设置time_zone和sql_mode，sql_mode在现有默认配置基础上加上NO_AUTO_VALUE_ON_ZERO和STRICT_ALL_TABLES
 		sessionQuery = fmt.Sprintf("%s, sql_mode = CONCAT(@@session.sql_mode, ',%s')", sessionQuery, sqlModeAddendum)
-
 		if _, err := tx.Exec(sessionQuery); err != nil {
 			return rollback(err)
 		}
+		//
 		for _, dmlEvent := range dmlEvents {
+			// buildDMLEventQuery根据binlog event生成在影子表上的回放SQL
 			for _, buildResult := range this.buildDMLEventQuery(dmlEvent) {
 				if buildResult.err != nil {
 					return rollback(buildResult.err)
 				}
-				result, err := tx.Exec(buildResult.query, buildResult.args...)
-				if err != nil {
+				// 执行回放SQL
+				if _, err := tx.Exec(buildResult.query, buildResult.args...); err != nil {
 					err = fmt.Errorf("%s; query=%s; args=%+v", err.Error(), buildResult.query, buildResult.args)
 					return rollback(err)
 				}
-
-				rowsAffected, err := result.RowsAffected()
-				if err != nil {
-					log.Warningf("error getting rows affected from DML event query: %s. i'm going to assume that the DML affected a single row, but this may result in inaccurate statistics", err)
-					rowsAffected = 1
-				}
-				// each DML is either a single insert (delta +1), update (delta +0) or delete (delta -1).
-				// multiplying by the rows actually affected (either 0 or 1) will give an accurate row delta for this DML event
-				totalDelta += buildResult.rowsDelta * rowsAffected
+				// 影子表记录数变化
+				totalDelta += buildResult.rowsDelta
 			}
 		}
+		// 多个回放SQL批量提交
 		if err := tx.Commit(); err != nil {
 			return err
 		}
@@ -1097,6 +1153,7 @@ func (this *Applier) ApplyDMLEventQueries(dmlEvents [](*binlog.BinlogDMLEvent)) 
 		return this.migrationContext.Log.Errore(err)
 	}
 	// no error
+	// 更新TotalDMLEventsApplied状态值
 	atomic.AddInt64(&this.migrationContext.TotalDMLEventsApplied, int64(len(dmlEvents)))
 	if this.migrationContext.CountTableRows {
 		atomic.AddInt64(&this.migrationContext.RowsDeltaEstimate, totalDelta)

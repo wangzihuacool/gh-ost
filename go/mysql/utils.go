@@ -14,8 +14,8 @@ import (
 
 	"github.com/github/gh-ost/go/sql"
 
-	"github.com/openark/golib/log"
-	"github.com/openark/golib/sqlutils"
+	"github.com/outbrain/golib/log"
+	"github.com/outbrain/golib/sqlutils"
 )
 
 const (
@@ -76,6 +76,7 @@ func GetReplicationLagFromSlaveStatus(informationSchemaDb *gosql.DB) (replicatio
 	return replicationLag, err
 }
 
+// 通过'show slave status' 来获取主库的 hostname:port
 func GetMasterKeyFromSlaveStatus(connectionConfig *ConnectionConfig) (masterKey *InstanceKey, err error) {
 	currentUri := connectionConfig.GetDBUri("information_schema")
 	// This function is only called once, okay to not have a cached connection pool
@@ -115,9 +116,11 @@ func GetMasterKeyFromSlaveStatus(connectionConfig *ConnectionConfig) (masterKey 
 	return masterKey, err
 }
 
+// 递归获取主库的连接配置
 func GetMasterConnectionConfigSafe(connectionConfig *ConnectionConfig, visitedKeys *InstanceKeyMap, allowMasterMaster bool) (masterConfig *ConnectionConfig, err error) {
 	log.Debugf("Looking for master on %+v", connectionConfig.Key)
 
+	// 通过'show slave status' 来获取主库的 hostname:port，如果返回空说明该节点为主库
 	masterKey, err := GetMasterKeyFromSlaveStatus(connectionConfig)
 	if err != nil {
 		return nil, err
@@ -128,6 +131,7 @@ func GetMasterConnectionConfigSafe(connectionConfig *ConnectionConfig, visitedKe
 	if !masterKey.IsValid() {
 		return connectionConfig, nil
 	}
+	// 生成主库的连接配置
 	masterConfig = connectionConfig.Duplicate()
 	masterConfig.Key = *masterKey
 
@@ -142,6 +146,7 @@ func GetMasterConnectionConfigSafe(connectionConfig *ConnectionConfig, visitedKe
 	return GetMasterConnectionConfigSafe(masterConfig, visitedKeys, allowMasterMaster)
 }
 
+// GetReplicationBinlogCoordinates 获取slave当前读取和回放的点位
 func GetReplicationBinlogCoordinates(db *gosql.DB) (readBinlogCoordinates *BinlogCoordinates, executeBinlogCoordinates *BinlogCoordinates, err error) {
 	err = sqlutils.QueryRowsMap(db, `show slave status`, func(m sqlutils.RowMap) error {
 		readBinlogCoordinates = &BinlogCoordinates{
@@ -188,6 +193,7 @@ func GetTableColumns(db *gosql.DB, databaseName, tableName string) (*sql.ColumnL
 	err := sqlutils.QueryRowsMap(db, query, func(rowMap sqlutils.RowMap) error {
 		columnName := rowMap.GetString("Field")
 		columnNames = append(columnNames, columnName)
+		// 检查虚拟列, Extra字段是否包含" GENERATED”，注意这里关键字前面有空格；否则在8.0中可能由于DEFAULT_GENERATED的时间列而不适用
 		if strings.Contains(rowMap.GetString("Extra"), " GENERATED") {
 			log.Debugf("%s is a generated column", columnName)
 			virtualColumnNames = append(virtualColumnNames, columnName)
@@ -204,10 +210,4 @@ func GetTableColumns(db *gosql.DB, databaseName, tableName string) (*sql.ColumnL
 		)
 	}
 	return sql.NewColumnList(columnNames), sql.NewColumnList(virtualColumnNames), nil
-}
-
-// Kill executes a KILL QUERY by connection id
-func Kill(db *gosql.DB, connectionID string) error {
-	_, err := db.Exec(`KILL QUERY %s`, connectionID)
-	return err
 }

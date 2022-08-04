@@ -1,5 +1,5 @@
 /*
-   Copyright 2022 GitHub Inc.
+   Copyright 2016 GitHub Inc.
 	 See https://github.com/github/gh-ost/blob/master/LICENSE
 */
 
@@ -16,7 +16,7 @@ import (
 	"github.com/github/gh-ost/go/binlog"
 	"github.com/github/gh-ost/go/mysql"
 
-	"github.com/openark/golib/sqlutils"
+	"github.com/outbrain/golib/sqlutils"
 )
 
 type BinlogEventListener struct {
@@ -33,6 +33,7 @@ const (
 
 // EventsStreamer reads data from binary logs and streams it on. It acts as a publisher,
 // and interested parties may subscribe for per-table events.
+// sync.Mutex - 互斥锁
 type EventsStreamer struct {
 	connectionConfig         *mysql.ConnectionConfig
 	db                       *gosql.DB
@@ -57,8 +58,11 @@ func NewEventsStreamer(migrationContext *base.MigrationContext) *EventsStreamer 
 }
 
 // AddListener registers a new listener for binlog events, on a per-table basis
+// AddListener 为每个表单独注册一个监听
+// 参数onDmlEvent为一个函数，函数定义由调用方传入
 func (this *EventsStreamer) AddListener(
 	async bool, databaseName string, tableName string, onDmlEvent func(event *binlog.BinlogDMLEvent) error) (err error) {
+
 	this.listenersMutex.Lock()
 	defer this.listenersMutex.Unlock()
 
@@ -86,12 +90,14 @@ func (this *EventsStreamer) notifyListeners(binlogEvent *binlog.BinlogDMLEvent) 
 
 	for _, listener := range this.listeners {
 		listener := listener
-		if !strings.EqualFold(listener.databaseName, binlogEvent.DatabaseName) {
+		// 获取listener中对应库表的binlogEvent
+		if strings.ToLower(listener.databaseName) != strings.ToLower(binlogEvent.DatabaseName) {
 			continue
 		}
-		if !strings.EqualFold(listener.tableName, binlogEvent.TableName) {
+		if strings.ToLower(listener.tableName) != strings.ToLower(binlogEvent.TableName) {
 			continue
 		}
+		// 根据listener.async判断是否异步处理，使用onDmlEvent处理binlogEvent
 		if listener.async {
 			go func() {
 				listener.onDmlEvent(binlogEvent)
@@ -102,17 +108,21 @@ func (this *EventsStreamer) notifyListeners(binlogEvent *binlog.BinlogDMLEvent) 
 	}
 }
 
+// 获取binlog当前位点，开始接收binlog event
 func (this *EventsStreamer) InitDBConnections() (err error) {
 	EventsStreamerUri := this.connectionConfig.GetDBUri(this.migrationContext.DatabaseName)
 	if this.db, _, err = mysql.GetDB(this.migrationContext.Uuid, EventsStreamerUri); err != nil {
 		return err
 	}
+	// 检验db连接
 	if _, err := base.ValidateConnection(this.db, this.connectionConfig, this.migrationContext, this.name); err != nil {
 		return err
 	}
+	// `show master status` 获取当前的binlog位点
 	if err := this.readCurrentBinlogCoordinates(); err != nil {
 		return err
 	}
+	// initBinlogReader creates and connects the reader: we hook up to a MySQL server as a replica
 	if err := this.initBinlogReader(this.initialBinlogCoordinates); err != nil {
 		return err
 	}
@@ -122,7 +132,12 @@ func (this *EventsStreamer) InitDBConnections() (err error) {
 
 // initBinlogReader creates and connects the reader: we hook up to a MySQL server as a replica
 func (this *EventsStreamer) initBinlogReader(binlogCoordinates *mysql.BinlogCoordinates) error {
-	goMySQLReader := binlog.NewGoMySQLReader(this.migrationContext)
+	// 创建一个binlogSyncer模拟从库用来从MySQL接收binlog
+	goMySQLReader, err := binlog.NewGoMySQLReader(this.migrationContext)
+	if err != nil {
+		return err
+	}
+	// ConnectBinlogStreamer 开始接收binlogSteam
 	if err := goMySQLReader.ConnectBinlogStreamer(*binlogCoordinates); err != nil {
 		return err
 	}
@@ -164,6 +179,7 @@ func (this *EventsStreamer) readCurrentBinlogCoordinates() error {
 // StreamEvents will begin streaming events. It will be blocking, so should be
 // executed by a goroutine
 func (this *EventsStreamer) StreamEvents(canStopStreaming func() bool) error {
+	// 异步运行，判断是DmlEvent则通知对应的listener处理DmlEvent
 	go func() {
 		for binlogEntry := range this.eventsChannel {
 			if binlogEntry.DmlEvent != nil {
@@ -178,6 +194,7 @@ func (this *EventsStreamer) StreamEvents(canStopStreaming func() bool) error {
 		if canStopStreaming() {
 			return nil
 		}
+		// 调用gomysql_read的StreamEvents， binlogReader.StreamEvents 处理binlog event，获取DMLEvent entry，调用handleRowsEvent将EventEntries写入entriesChannel
 		if err := this.binlogReader.StreamEvents(canStopStreaming, this.eventsChannel); err != nil {
 			if canStopStreaming() {
 				return nil
@@ -216,4 +233,5 @@ func (this *EventsStreamer) Close() (err error) {
 
 func (this *EventsStreamer) Teardown() {
 	this.db.Close()
+	return
 }

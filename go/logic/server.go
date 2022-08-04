@@ -1,5 +1,5 @@
 /*
-   Copyright 2022 GitHub Inc.
+   Copyright 2021 GitHub Inc.
 	 See https://github.com/github/gh-ost/blob/master/LICENSE
 */
 
@@ -100,17 +100,21 @@ func (this *Server) handleConnection(conn net.Conn) (err error) {
 	if conn != nil {
 		defer conn.Close()
 	}
+	// 读取用户请求
+	// bufio为缓存IO。bufio.NewReader实例化bufio.Reader对象的函数；ReadLine()函数尝试返回单独的行，不包括行尾的换行符
+	// 参考：https://books.studygolang.com/The-Golang-Standard-Library-by-Example/chapter01/01.4.html
 	command, _, err := bufio.NewReader(conn).ReadLine()
 	if err != nil {
 		return err
 	}
+	// 处理用户请求
 	return this.onServerCommand(string(command), bufio.NewWriter(conn))
 }
 
 // onServerCommand responds to a user's interactive command
 func (this *Server) onServerCommand(command string, writer *bufio.Writer) (err error) {
 	defer writer.Flush()
-
+    // 解析用户输入的命令，并执行
 	printStatusRule, err := this.applyServerCommand(command, writer)
 	if err == nil {
 		this.printStatus(printStatusRule, writer)
@@ -122,22 +126,28 @@ func (this *Server) onServerCommand(command string, writer *bufio.Writer) (err e
 
 // applyServerCommand parses and executes commands by user
 func (this *Server) applyServerCommand(command string, writer *bufio.Writer) (printStatusRule PrintStatusRule, err error) {
+	printStatusRule = NoPrintStatusRule
+
+	// strings.Split和SplitN对字符串按分隔符分隔，Split等同于SplitN(s, sep, -1), SplitN(s, sep, 2)表示只返回2个元素,后面那个元素不会分隔
 	tokens := strings.SplitN(command, "=", 2)
+	// 将 s 左侧和右侧的间隔符去掉。常见间隔符包括：'\t', '\n', '\v', '\f', '\r', ' ', U+0085 (NEL)
 	command = strings.TrimSpace(tokens[0])
 	arg := ""
 	if len(tokens) > 1 {
 		arg = strings.TrimSpace(tokens[1])
+		// 去掉value的引号
 		if unquoted, err := strconv.Unquote(arg); err == nil {
 			arg = unquoted
 		}
 	}
 	argIsQuestion := (arg == "?")
-	throttleHint := "# Note: you may only throttle for as long as your binary logs are not purged"
-
+	throttleHint := "# Note: you may only throttle for as long as your binary logs are not purged\n"
+    // 执行用户交互命令对应的钩子
 	if err := this.hooksExecutor.onInteractiveCommand(command); err != nil {
 		return NoPrintStatusRule, err
 	}
 
+	// 根据用户交互命令，更新context的变量值，或者打印
 	switch command {
 	case "help":
 		{
@@ -199,9 +209,11 @@ help                                 # This message
 				fmt.Fprintf(writer, "%+v\n", atomic.LoadInt64(&this.migrationContext.ChunkSize))
 				return NoPrintStatusRule, nil
 			}
+			// strconv.Atoi() 将字符串转换成整型
 			if chunkSize, err := strconv.Atoi(arg); err != nil {
 				return NoPrintStatusRule, err
 			} else {
+				// 更新context的参数值
 				this.migrationContext.SetChunkSize(int64(chunkSize))
 				return ForcePrintStatusAndHintRule, nil
 			}
@@ -280,7 +292,7 @@ help                                 # This message
 				return NoPrintStatusRule, nil
 			}
 			this.migrationContext.SetThrottleQuery(arg)
-			fmt.Fprintln(writer, throttleHint)
+			fmt.Fprintf(writer, throttleHint)
 			return ForcePrintStatusAndHintRule, nil
 		}
 	case "throttle-http":
@@ -290,7 +302,7 @@ help                                 # This message
 				return NoPrintStatusRule, nil
 			}
 			this.migrationContext.SetThrottleHTTP(arg)
-			fmt.Fprintln(writer, throttleHint)
+			fmt.Fprintf(writer, throttleHint)
 			return ForcePrintStatusAndHintRule, nil
 		}
 	case "throttle-control-replicas":
@@ -313,7 +325,7 @@ help                                 # This message
 				return NoPrintStatusRule, err
 			}
 			atomic.StoreInt64(&this.migrationContext.ThrottleCommandedByUser, 1)
-			fmt.Fprintln(writer, throttleHint)
+			fmt.Fprintf(writer, throttleHint)
 			return ForcePrintStatusAndHintRule, nil
 		}
 	case "no-throttle", "unthrottle", "resume", "continue":

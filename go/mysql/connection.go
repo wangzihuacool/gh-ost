@@ -112,6 +112,7 @@ func (this *ConnectionConfig) GetDBUri(databaseName string) string {
 		// Wrap IPv6 literals in square brackets
 		hostname = fmt.Sprintf("[%s]", hostname)
 	}
+	// interpolateParams 省略掉prepare的过程，直接拼接参数到query里面，减少与MySQL通讯的网络开销
 	interpolateParams := true
 	// go-mysql-driver defaults to false if tls param is not provided; explicitly setting here to
 	// simplify construction of the DSN below.
@@ -119,5 +120,7 @@ func (this *ConnectionConfig) GetDBUri(databaseName string) string {
 	if this.tlsConfig != nil {
 		tlsOption = TLS_CONFIG_KEY
 	}
+	// 这里charset=utf8mb4,utf8,latin1的意思是，尝试执行set names utf8mb4，如果失败则执行set names utf8，如果失败则执行set names latin1
+	// 参考：https://github.com/go-sql-driver/mysql/blob/e8f8fcdbd3e06fc74b6cf745c13eaebedff68c49/README.md
 	return fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?timeout=%fs&readTimeout=%fs&writeTimeout=%fs&interpolateParams=%t&autocommit=true&charset=utf8mb4,utf8,latin1&tls=%s", this.User, this.Password, hostname, this.Key.Port, databaseName, this.Timeout, this.Timeout, this.Timeout, interpolateParams, tlsOption)
 }

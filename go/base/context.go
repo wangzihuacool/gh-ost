@@ -1,5 +1,5 @@
 /*
-   Copyright 2022 GitHub Inc.
+   Copyright 2016 GitHub Inc.
 	 See https://github.com/github/gh-ost/blob/master/LICENSE
 */
 
@@ -15,13 +15,14 @@ import (
 	"sync/atomic"
 	"time"
 
-	uuid "github.com/satori/go.uuid"
+	"github.com/satori/go.uuid"
 
 	"github.com/github/gh-ost/go/mysql"
 	"github.com/github/gh-ost/go/sql"
-	"github.com/openark/golib/log"
+	"github.com/outbrain/golib/log"
 
-	"github.com/go-ini/ini"
+	"gopkg.in/gcfg.v1"
+	gcfgscanner "gopkg.in/gcfg.v1/scanner"
 )
 
 // RowsEstimateMethod is the type of row number estimation
@@ -35,6 +36,7 @@ const (
 
 type CutOver int
 
+// iota 自增值，第一个变量为0，第二个变量为1，以此类推
 const (
 	CutOverAtomic CutOver = iota
 	CutOverTwoStep
@@ -64,6 +66,7 @@ type ThrottleCheckResult struct {
 	ReasonHint     ThrottleReasonHint
 }
 
+// NewThrottleCheckResult 初始化 ThrottleCheckResult
 func NewThrottleCheckResult(throttle bool, reason string, reasonHint ThrottleReasonHint) *ThrottleCheckResult {
 	return &ThrottleCheckResult{
 		ShouldThrottle: throttle,
@@ -82,8 +85,6 @@ type MigrationContext struct {
 	AlterStatement        string
 	AlterStatementOptions string // anything following the 'ALTER TABLE [schema.]table' from AlterStatement
 
-	countMutex               sync.Mutex
-	countTableRowsCancelFunc func()
 	CountTableRows           bool
 	ConcurrentCountTableRows bool
 	AllowedRunningOnMaster   bool
@@ -186,9 +187,7 @@ type MigrationContext struct {
 	CurrentLag                             int64
 	currentProgress                        uint64
 	etaNanoseonds                          int64
-	ThrottleHTTPIntervalMillis             int64
 	ThrottleHTTPStatusCode                 int64
-	ThrottleHTTPTimeoutMillis              int64
 	controlReplicasLagResult               mysql.ReplicationLagResult
 	TotalRowsCopied                        int64
 	TotalDMLEventsApplied                  int64
@@ -226,6 +225,7 @@ type MigrationContext struct {
 	Iteration                        int64
 	MigrationIterationRangeMinValues *sql.ColumnValues
 	MigrationIterationRangeMaxValues *sql.ColumnValues
+	// ForceTmpTableName 用来指定临时表表名，无论源表名是啥
 	ForceTmpTableName                string
 
 	recentBinlogCoordinates mysql.BinlogCoordinates
@@ -288,6 +288,7 @@ func NewMigrationContext() *MigrationContext {
 	}
 }
 
+// getSafeTableName 用来生成以suffix为后缀的心跳表和影子表以及old临时表
 func getSafeTableName(baseName string, suffix string) string {
 	name := fmt.Sprintf("_%s_%s", baseName, suffix)
 	if len(name) <= mysql.MaxTableNameLength {
@@ -323,6 +324,7 @@ func (this *MigrationContext) GetOldTableName() string {
 			t.Hour(), t.Minute(), t.Second())
 		return getSafeTableName(tableName, fmt.Sprintf("%s_del", timestamp))
 	}
+	// 返回old临时表，命名方式为：_TABLE_del
 	return getSafeTableName(tableName, "del")
 }
 
@@ -382,6 +384,7 @@ func (this *MigrationContext) HasMigrationRange() bool {
 	return this.MigrationRangeMinValues != nil && this.MigrationRangeMaxValues != nil
 }
 
+// CutOver的timeout时间默认3s，范围：1-10
 func (this *MigrationContext) SetCutOverLockTimeoutSeconds(timeoutSeconds int64) error {
 	if timeoutSeconds < 1 {
 		return fmt.Errorf("Minimal timeout is 1sec. Timeout remains at %d", this.CutOverLockTimeoutSeconds)
@@ -401,6 +404,7 @@ func (this *MigrationContext) SetExponentialBackoffMaxInterval(intervalSeconds i
 	return nil
 }
 
+// 设置最大重试次数,默认60
 func (this *MigrationContext) SetDefaultNumRetries(retries int64) {
 	this.throttleMutex.Lock()
 	defer this.throttleMutex.Unlock()
@@ -409,6 +413,7 @@ func (this *MigrationContext) SetDefaultNumRetries(retries int64) {
 	}
 }
 
+// MaxRetries 获取最大重试次数
 func (this *MigrationContext) MaxRetries() int64 {
 	this.throttleMutex.Lock()
 	defer this.throttleMutex.Unlock()
@@ -416,6 +421,7 @@ func (this *MigrationContext) MaxRetries() int64 {
 	return retries
 }
 
+// IsTransactionalTable 判断表引擎是否事务性引擎，只有innodb和tokudb是事务性引擎
 func (this *MigrationContext) IsTransactionalTable() bool {
 	switch strings.ToLower(this.TableEngine) {
 	case "innodb":
@@ -430,42 +436,12 @@ func (this *MigrationContext) IsTransactionalTable() bool {
 	return false
 }
 
-// SetCountTableRowsCancelFunc sets the cancel function for the CountTableRows query context
-func (this *MigrationContext) SetCountTableRowsCancelFunc(f func()) {
-	this.countMutex.Lock()
-	defer this.countMutex.Unlock()
-
-	this.countTableRowsCancelFunc = f
-}
-
-// IsCountingTableRows returns true if the migration has a table count query running
-func (this *MigrationContext) IsCountingTableRows() bool {
-	this.countMutex.Lock()
-	defer this.countMutex.Unlock()
-
-	return this.countTableRowsCancelFunc != nil
-}
-
-// CancelTableRowsCount cancels the CountTableRows query context. It is safe to
-// call function even when IsCountingTableRows is false.
-func (this *MigrationContext) CancelTableRowsCount() {
-	this.countMutex.Lock()
-	defer this.countMutex.Unlock()
-
-	if this.countTableRowsCancelFunc == nil {
-		return
-	}
-
-	this.countTableRowsCancelFunc()
-	this.countTableRowsCancelFunc = nil
-}
-
 // ElapsedTime returns time since very beginning of the process
 func (this *MigrationContext) ElapsedTime() time.Duration {
 	return time.Since(this.StartTime)
 }
 
-// MarkRowCopyStartTime
+// MarkRowCopyStartTime 获取当前时间赋值给RowCopyStartTime
 func (this *MigrationContext) MarkRowCopyStartTime() {
 	this.throttleMutex.Lock()
 	defer this.throttleMutex.Unlock()
@@ -495,10 +471,12 @@ func (this *MigrationContext) MarkRowCopyEndTime() {
 	this.RowCopyEndTime = time.Now()
 }
 
+// time.Since() 返回从时间t到当前时间的差值，即过去了多久; 相当于 time.Now().Sub(t)
 func (this *MigrationContext) TimeSinceLastHeartbeatOnChangelog() time.Duration {
 	return time.Since(this.GetLastHeartbeatOnChangelogTime())
 }
 
+// Go语言中的LoadInt64()函数用于原子加载* addr
 func (this *MigrationContext) GetCurrentLagDuration() time.Duration {
 	return time.Duration(atomic.LoadInt64(&this.CurrentLag))
 }
@@ -508,6 +486,8 @@ func (this *MigrationContext) GetProgressPct() float64 {
 }
 
 func (this *MigrationContext) SetProgressPct(progressPct float64) {
+	// 将math.Float64bits(progressPct)的值存到this.currentProgress
+	// atomic.StoreUint64 将64位无符号整型存到参数
 	atomic.StoreUint64(&this.currentProgress, math.Float64bits(progressPct))
 }
 
@@ -568,6 +548,7 @@ func (this *MigrationContext) GetLastHeartbeatOnChangelogTime() time.Time {
 	return this.lastHeartbeatOnChangelogTime
 }
 
+// 心跳频率只有100ms和1s
 func (this *MigrationContext) SetHeartbeatIntervalMilliseconds(heartbeatIntervalMilliseconds int64) {
 	if heartbeatIntervalMilliseconds < 100 {
 		heartbeatIntervalMilliseconds = 100
@@ -578,6 +559,7 @@ func (this *MigrationContext) SetHeartbeatIntervalMilliseconds(heartbeatInterval
 	this.HeartbeatIntervalMilliseconds = heartbeatIntervalMilliseconds
 }
 
+// 复制延迟阈值,最小100
 func (this *MigrationContext) SetMaxLagMillisecondsThrottleThreshold(maxLagMillisecondsThrottleThreshold int64) {
 	if maxLagMillisecondsThrottleThreshold < 100 {
 		maxLagMillisecondsThrottleThreshold = 100
@@ -585,6 +567,7 @@ func (this *MigrationContext) SetMaxLagMillisecondsThrottleThreshold(maxLagMilli
 	atomic.StoreInt64(&this.MaxLagMillisecondsThrottleThreshold, maxLagMillisecondsThrottleThreshold)
 }
 
+// chunksize范围：10-100000
 func (this *MigrationContext) SetChunkSize(chunkSize int64) {
 	if chunkSize < 10 {
 		chunkSize = 10
@@ -595,6 +578,7 @@ func (this *MigrationContext) SetChunkSize(chunkSize int64) {
 	atomic.StoreInt64(&this.ChunkSize, chunkSize)
 }
 
+// DMLBatchSize 范围：1-1000
 func (this *MigrationContext) SetDMLBatchSize(batchSize int64) {
 	if batchSize < 1 {
 		batchSize = 1
@@ -605,6 +589,7 @@ func (this *MigrationContext) SetDMLBatchSize(batchSize int64) {
 	atomic.StoreInt64(&this.DMLBatchSize, batchSize)
 }
 
+// SetThrottleGeneralCheckResult 设置throttleGeneralCheckResult
 func (this *MigrationContext) SetThrottleGeneralCheckResult(checkResult *ThrottleCheckResult) *ThrottleCheckResult {
 	this.throttleMutex.Lock()
 	defer this.throttleMutex.Unlock()
@@ -612,6 +597,7 @@ func (this *MigrationContext) SetThrottleGeneralCheckResult(checkResult *Throttl
 	return checkResult
 }
 
+// GetThrottleGeneralCheckResult 获取throttleGeneralCheckResult的结果
 func (this *MigrationContext) GetThrottleGeneralCheckResult() *ThrottleCheckResult {
 	this.throttleMutex.Lock()
 	defer this.throttleMutex.Unlock()
@@ -619,6 +605,7 @@ func (this *MigrationContext) GetThrottleGeneralCheckResult() *ThrottleCheckResu
 	return &result
 }
 
+// SetThrottled 修改context参数为throttle
 func (this *MigrationContext) SetThrottled(throttle bool, reason string, reasonHint ThrottleReasonHint) {
 	this.throttleMutex.Lock()
 	defer this.throttleMutex.Unlock()
@@ -627,6 +614,7 @@ func (this *MigrationContext) SetThrottled(throttle bool, reason string, reasonH
 	this.throttleReasonHint = reasonHint
 }
 
+// 返回是否限流，注意cut-over阶段不接受限流
 func (this *MigrationContext) IsThrottled() (bool, string, ThrottleReasonHint) {
 	this.throttleMutex.Lock()
 	defer this.throttleMutex.Unlock()
@@ -658,6 +646,7 @@ func (this *MigrationContext) SetThrottleQuery(newQuery string) {
 	this.throttleQuery = newQuery
 }
 
+// GetThrottleHTTP 返回throttleHTTP参数值
 func (this *MigrationContext) GetThrottleHTTP() string {
 	this.throttleHTTPMutex.Lock()
 	defer this.throttleHTTPMutex.Unlock()
@@ -680,6 +669,7 @@ func (this *MigrationContext) SetIgnoreHTTPErrors(ignoreHTTPErrors bool) {
 	this.IgnoreHTTPErrors = ignoreHTTPErrors
 }
 
+// 获取maxload的参数配置
 func (this *MigrationContext) GetMaxLoad() LoadMap {
 	this.throttleMutex.Lock()
 	defer this.throttleMutex.Unlock()
@@ -687,6 +677,7 @@ func (this *MigrationContext) GetMaxLoad() LoadMap {
 	return this.maxLoad.Duplicate()
 }
 
+// 获取CriticalLoad的参数配置
 func (this *MigrationContext) GetCriticalLoad() LoadMap {
 	this.throttleMutex.Lock()
 	defer this.throttleMutex.Unlock()
@@ -701,6 +692,7 @@ func (this *MigrationContext) GetNiceRatio() float64 {
 	return this.niceRatio
 }
 
+// NiceRatio范围：0-100
 func (this *MigrationContext) SetNiceRatio(newRatio float64) {
 	if newRatio < 0.0 {
 		newRatio = 0.0
@@ -721,6 +713,7 @@ func (this *MigrationContext) GetRecentBinlogCoordinates() mysql.BinlogCoordinat
 	return this.recentBinlogCoordinates
 }
 
+// SetRecentBinlogCoordinates 更新当前binlog位点
 func (this *MigrationContext) SetRecentBinlogCoordinates(coordinates mysql.BinlogCoordinates) {
 	this.throttleMutex.Lock()
 	defer this.throttleMutex.Unlock()
@@ -757,6 +750,7 @@ func (this *MigrationContext) ReadCriticalLoad(criticalLoadList string) error {
 	return nil
 }
 
+// GetControlReplicasLagResult 获取replicationlag的值
 func (this *MigrationContext) GetControlReplicasLagResult() mysql.ReplicationLagResult {
 	this.throttleMutex.Lock()
 	defer this.throttleMutex.Unlock()
@@ -765,6 +759,7 @@ func (this *MigrationContext) GetControlReplicasLagResult() mysql.ReplicationLag
 	return lagResult
 }
 
+// 更新复制延迟时间到context的controlReplicasLagResult
 func (this *MigrationContext) SetControlReplicasLagResult(lagResult *mysql.ReplicationLagResult) {
 	this.throttleMutex.Lock()
 	defer this.throttleMutex.Unlock()
@@ -775,6 +770,7 @@ func (this *MigrationContext) SetControlReplicasLagResult(lagResult *mysql.Repli
 	}
 }
 
+// 获取检测复制延迟的mysql节点信息
 func (this *MigrationContext) GetThrottleControlReplicaKeys() *mysql.InstanceKeyMap {
 	this.throttleMutex.Lock()
 	defer this.throttleMutex.Unlock()
@@ -784,6 +780,7 @@ func (this *MigrationContext) GetThrottleControlReplicaKeys() *mysql.InstanceKey
 	return keys
 }
 
+// throttleControlReplicas 指定检测复制延迟的mysql节点
 func (this *MigrationContext) ReadThrottleControlReplicaKeys(throttleControlReplicas string) error {
 	keys := mysql.NewInstanceKeyMap()
 	if err := keys.ReadCommaDelimitedList(throttleControlReplicas); err != nil {
@@ -841,39 +838,10 @@ func (this *MigrationContext) ReadConfigFile() error {
 	if this.ConfigFile == "" {
 		return nil
 	}
-	cfg, err := ini.Load(this.ConfigFile)
-	if err != nil {
-		return err
-	}
-
-	if cfg.Section("client").HasKey("user") {
-		this.config.Client.User = cfg.Section("client").Key("user").String()
-	}
-
-	if cfg.Section("client").HasKey("password") {
-		this.config.Client.Password = cfg.Section("client").Key("password").String()
-	}
-
-	if cfg.Section("osc").HasKey("chunk_size") {
-		this.config.Osc.Chunk_Size, err = cfg.Section("osc").Key("chunk_size").Int64()
-		if err != nil {
-			return fmt.Errorf("Unable to read osc chunk size: %s", err.Error())
-		}
-	}
-
-	if cfg.Section("osc").HasKey("max_load") {
-		this.config.Osc.Max_Load = cfg.Section("osc").Key("max_load").String()
-	}
-
-	if cfg.Section("osc").HasKey("replication_lag_query") {
-		this.config.Osc.Replication_Lag_Query = cfg.Section("osc").Key("replication_lag_query").String()
-	}
-
-	if cfg.Section("osc").HasKey("max_lag_millis") {
-		this.config.Osc.Max_Lag_Millis, err = cfg.Section("osc").Key("max_lag_millis").Int64()
-		if err != nil {
-			return fmt.Errorf("Unable to read max lag millis: %s", err.Error())
-		}
+	gcfg.RelaxedParserMode = true
+	gcfgscanner.RelaxedScannerMode = true
+	if err := gcfg.ReadFileInto(&this.config, this.ConfigFile); err != nil {
+		return fmt.Errorf("Error reading config file %s. Details: %s", this.ConfigFile, err.Error())
 	}
 
 	// We accept user & password in the form "${SOME_ENV_VARIABLE}" in which case we pull

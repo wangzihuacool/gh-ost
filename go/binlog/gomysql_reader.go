@@ -1,5 +1,5 @@
 /*
-   Copyright 2022 GitHub Inc.
+   Copyright 2016 GitHub Inc.
 	 See https://github.com/github/gh-ost/blob/master/LICENSE
 */
 
@@ -13,14 +13,16 @@ import (
 	"github.com/github/gh-ost/go/mysql"
 	"github.com/github/gh-ost/go/sql"
 
-	gomysql "github.com/go-mysql-org/go-mysql/mysql"
-	"github.com/go-mysql-org/go-mysql/replication"
+	gomysql "github.com/siddontang/go-mysql/mysql"
+	"github.com/siddontang/go-mysql/replication"
 	"golang.org/x/net/context"
 )
 
 type GoMySQLReader struct {
 	migrationContext         *base.MigrationContext
 	connectionConfig         *mysql.ConnectionConfig
+	// 引用replication库的结构体，BinlogSyncer syncs binlog event from server.
+	// https://github.com/go-mysql-org/go-mysql/blob/master/replication/binlogsyncer.go
 	binlogSyncer             *replication.BinlogSyncer
 	binlogStreamer           *replication.BinlogStreamer
 	currentCoordinates       mysql.BinlogCoordinates
@@ -28,27 +30,40 @@ type GoMySQLReader struct {
 	LastAppliedRowsEventHint mysql.BinlogCoordinates
 }
 
-func NewGoMySQLReader(migrationContext *base.MigrationContext) *GoMySQLReader {
-	connectionConfig := migrationContext.InspectorConnectionConfig
-	return &GoMySQLReader{
+func NewGoMySQLReader(migrationContext *base.MigrationContext) (binlogReader *GoMySQLReader, err error) {
+	binlogReader = &GoMySQLReader{
 		migrationContext:        migrationContext,
-		connectionConfig:        connectionConfig,
+		connectionConfig:        migrationContext.InspectorConnectionConfig,
 		currentCoordinates:      mysql.BinlogCoordinates{},
 		currentCoordinatesMutex: &sync.Mutex{},
-		binlogSyncer: replication.NewBinlogSyncer(replication.BinlogSyncerConfig{
-			ServerID:   uint32(migrationContext.ReplicaServerId),
-			Flavor:     gomysql.MySQLFlavor,
-			Host:       connectionConfig.Key.Hostname,
-			Port:       uint16(connectionConfig.Key.Port),
-			User:       connectionConfig.User,
-			Password:   connectionConfig.Password,
-			TLSConfig:  connectionConfig.TLSConfig(),
-			UseDecimal: true,
-		}),
+		binlogSyncer:            nil,
+		binlogStreamer:          nil,
 	}
+
+	// 模拟从库的server_id
+	serverId := uint32(migrationContext.ReplicaServerId)
+
+	// 引用replication库的结构体，BinlogSyncerConfig is the configuration for BinlogSyncer.
+	// https://github.com/go-mysql-org/go-mysql/blob/master/replication/binlogsyncer.go
+	binlogSyncerConfig := replication.BinlogSyncerConfig{
+		ServerID:   serverId,
+		Flavor:     "mysql",
+		Host:       binlogReader.connectionConfig.Key.Hostname,
+		Port:       uint16(binlogReader.connectionConfig.Key.Port),
+		User:       binlogReader.connectionConfig.User,
+		Password:   binlogReader.connectionConfig.Password,
+		TLSConfig:  binlogReader.connectionConfig.TLSConfig(),
+		// Use decimal.Decimal structure for decimals.
+		UseDecimal: true,
+	}
+	// 创建一个binlogSyncer接收binlog，引用replication库的函数。
+	// https://github.com/go-mysql-org/go-mysql/blob/master/replication/binlogsyncer.go
+	binlogReader.binlogSyncer = replication.NewBinlogSyncer(binlogSyncerConfig)
+    // 返回replication库的BinlogSyncer结构体的一个实例
+	return binlogReader, err
 }
 
-// ConnectBinlogStreamer
+// ConnectBinlogStreamer 开始接收binlogSteam
 func (this *GoMySQLReader) ConnectBinlogStreamer(coordinates mysql.BinlogCoordinates) (err error) {
 	if coordinates.IsEmpty() {
 		return this.migrationContext.Log.Errorf("Empty coordinates at ConnectBinlogStreamer()")
@@ -57,10 +72,7 @@ func (this *GoMySQLReader) ConnectBinlogStreamer(coordinates mysql.BinlogCoordin
 	this.currentCoordinates = coordinates
 	this.migrationContext.Log.Infof("Connecting binlog streamer at %+v", this.currentCoordinates)
 	// Start sync with specified binlog file and position
-	this.binlogStreamer, err = this.binlogSyncer.StartSync(gomysql.Position{
-		Name: this.currentCoordinates.LogFile,
-		Pos:  uint32(this.currentCoordinates.LogPos),
-	})
+	this.binlogStreamer, err = this.binlogSyncer.StartSync(gomysql.Position{this.currentCoordinates.LogFile, uint32(this.currentCoordinates.LogPos)})
 
 	return err
 }
@@ -72,7 +84,7 @@ func (this *GoMySQLReader) GetCurrentBinlogCoordinates() *mysql.BinlogCoordinate
 	return &returnCoordinates
 }
 
-// StreamEvents
+// handleRowsEvent 处理RowsEvent，写入信道entriesChannel
 func (this *GoMySQLReader) handleRowsEvent(ev *replication.BinlogEvent, rowsEvent *replication.RowsEvent, entriesChannel chan<- *BinlogEntry) error {
 	if this.currentCoordinates.SmallerThanOrEquals(&this.LastAppliedRowsEventHint) {
 		this.migrationContext.Log.Debugf("Skipping handled query at %+v", this.currentCoordinates)
@@ -120,7 +132,7 @@ func (this *GoMySQLReader) handleRowsEvent(ev *replication.BinlogEvent, rowsEven
 	return nil
 }
 
-// StreamEvents
+// StreamEvents 处理binlog event，获取DMLEvent entry，调用handleRowsEvent将EventEntries写入entriesChannel
 func (this *GoMySQLReader) StreamEvents(canStopStreaming func() bool, entriesChannel chan<- *BinlogEntry) error {
 	if canStopStreaming() {
 		return nil
@@ -129,6 +141,10 @@ func (this *GoMySQLReader) StreamEvents(canStopStreaming func() bool, entriesCha
 		if canStopStreaming() {
 			break
 		}
+		// binlogStreamer.GetEvent gets the binlog event one by one,it will block until Syncer receives any events from MySQL
+		// You can pass a context (like Cancel or Timeout) to break the block
+		// context.Background() 返回一个空的context，这里传一个空的context给GetEvent()函数
+		// ev 即返回的BinlogEvent
 		ev, err := this.binlogStreamer.GetEvent(context.Background())
 		if err != nil {
 			return err
@@ -136,19 +152,21 @@ func (this *GoMySQLReader) StreamEvents(canStopStreaming func() bool, entriesCha
 		func() {
 			this.currentCoordinatesMutex.Lock()
 			defer this.currentCoordinatesMutex.Unlock()
+			// 获取下一个event的位点
 			this.currentCoordinates.LogPos = int64(ev.Header.LogPos)
 		}()
-
-		switch binlogEvent := ev.Event.(type) {
-		case *replication.RotateEvent:
+		// rotateEvent处理，读取下一个binlog
+		if rotateEvent, ok := ev.Event.(*replication.RotateEvent); ok {
 			func() {
 				this.currentCoordinatesMutex.Lock()
 				defer this.currentCoordinatesMutex.Unlock()
-				this.currentCoordinates.LogFile = string(binlogEvent.NextLogName)
+				// 下一个event的logfile
+				this.currentCoordinates.LogFile = string(rotateEvent.NextLogName)
 			}()
-			this.migrationContext.Log.Infof("rotate to next log from %s:%d to %s", this.currentCoordinates.LogFile, int64(ev.Header.LogPos), binlogEvent.NextLogName)
-		case *replication.RowsEvent:
-			if err := this.handleRowsEvent(ev, binlogEvent, entriesChannel); err != nil {
+			this.migrationContext.Log.Infof("rotate to next log from %s:%d to %s", this.currentCoordinates.LogFile, int64(ev.Header.LogPos), rotateEvent.NextLogName)
+		// 处理RowsEvent，将binlogEntry写入信道entriesChannel
+		} else if rowsEvent, ok := ev.Event.(*replication.RowsEvent); ok {
+			if err := this.handleRowsEvent(ev, rowsEvent, entriesChannel); err != nil {
 				return err
 			}
 		}

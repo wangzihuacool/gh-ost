@@ -23,20 +23,20 @@ function build {
     exit 1
   fi
 
-  echo "Building ${osname}-${GOARCH} binary"
+  # TODO: remove GO111MODULE once gh-ost uses Go modules
+  echo "Building ${osname} binary"
   export GOOS
   export GOARCH
-  go build -ldflags "$ldflags" -o $buildpath/$target go/cmd/gh-ost/main.go
+  GO111MODULE=off go build -ldflags "$ldflags" -o $buildpath/$target go/cmd/gh-ost/main.go
 
   if [ $? -ne 0 ]; then
-      echo "Build failed for ${osname} ${GOARCH}."
+      echo "Build failed for ${osname}"
       exit 1
   fi
 
-  (cd $buildpath && tar cfz ./gh-ost-binary-${osshort}-${GOARCH}-${timestamp}.tar.gz $target)
+  (cd $buildpath && tar cfz ./gh-ost-binary-${osshort}-${timestamp}.tar.gz $target)
 
-  # build RPM and deb for Linux, x86-64 only
-  if [ "$GOOS" == "linux" ] && [ "$GOARCH" == "amd64" ] ; then
+  if [ "$GOOS" == "linux" ] ; then
     echo "Creating Distro full packages"
     builddir=$(setuptree)
     cp $buildpath/$target $builddir/gh-ost/usr/bin
@@ -64,9 +64,7 @@ main() {
   mkdir -p ${buildpath}
   rm -rf ${buildpath:?}/*
   build GNU/Linux linux linux amd64
-  build GNU/Linux linux linux arm64
   build macOS osx darwin amd64
-  build macOS osx darwin arm64
 
   echo "Binaries found in:"
   find $buildpath/gh-ost* -type f -maxdepth 1
@@ -74,5 +72,8 @@ main() {
   echo "Checksums:"
   (cd $buildpath && shasum -a256 gh-ost* 2>/dev/null)
 }
+
+. script/bootstrap
+cd .gopath/src/github.com/github/gh-ost
 
 main "$@"

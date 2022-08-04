@@ -1,5 +1,5 @@
 /*
-   Copyright 2022 GitHub Inc.
+   Copyright 2016 GitHub Inc.
 	 See https://github.com/github/gh-ost/blob/master/LICENSE
 */
 
@@ -21,11 +21,14 @@ var (
 	prettifyDurationRegexp = regexp.MustCompile("([.][0-9]+)")
 )
 
+// 可读方式格式化持续时间
 func PrettifyDurationOutput(d time.Duration) string {
 	if d < time.Second {
 		return "0s"
 	}
-	return prettifyDurationRegexp.ReplaceAllString(d.String(), "")
+	result := fmt.Sprintf("%s", d)
+	result = prettifyDurationRegexp.ReplaceAllString(result, "")
+	return result
 }
 
 func FileExists(fileName string) bool {
@@ -61,6 +64,7 @@ func StringContainsAll(s string, substrings ...string) bool {
 	return nonEmptyStringsFound
 }
 
+// 校验db连接
 func ValidateConnection(db *gosql.DB, connectionConfig *mysql.ConnectionConfig, migrationContext *MigrationContext, name string) (string, error) {
 	versionQuery := `select @@global.version`
 	var port, extraPort int
@@ -69,7 +73,8 @@ func ValidateConnection(db *gosql.DB, connectionConfig *mysql.ConnectionConfig, 
 		return "", err
 	}
 	extraPortQuery := `select @@global.extra_port`
-	if err := db.QueryRow(extraPortQuery).Scan(&extraPort); err != nil { // nolint:staticcheck
+	// func (r *Rows) Scan(dest ...interface{}) error 函数将当前行各列结果填充进dest指定的各个值中，用于在迭代中获取一行结果。
+	if err := db.QueryRow(extraPortQuery).Scan(&extraPort); err != nil {
 		// swallow this error. not all servers support extra_port
 	}
 	// AliyunRDS set users port to "NULL", replace it by gh-ost param
