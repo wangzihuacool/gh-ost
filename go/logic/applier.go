@@ -946,7 +946,7 @@ func (this *Applier) AtomicCutOverMagicLock(sessionIdChan chan int64, tableLocke
 			// We DO NOT return here because we must `UNLOCK TABLES`!
 		}
 	})
-    sentryTableDropped <- nil
+	sentryTableDropped <- nil
 
 	// the magic table was dropped, we wait here until one of the following conditions is met:
 	// 1. the RENAME thread is currently waiting for metadata lock on OriginalTable, and is safe to unlock tables;

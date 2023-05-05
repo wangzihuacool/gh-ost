@@ -719,7 +719,7 @@ func (this *Migrator) atomicCutOver() (err error) {
 	// BAM! magic table dropped.
 
 	<-sentryTableDropped
-    // Now that magic table is dropped, we expect that the RENAME thread is waiting for metadata lock on OriginalTable,
+	// Now that magic table is dropped, we expect that the RENAME thread is waiting for metadata lock on OriginalTable,
 	// and we confirm it.
 	waitForPendingMetadataLock := func() error {
 		if atomic.LoadInt64(&tableRenameKnownToHaveFailed) == 1 {
