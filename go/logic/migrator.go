@@ -638,10 +638,12 @@ func (this *Migrator) atomicCutOver() (err error) {
 	atomic.StoreInt64(&this.migrationContext.InCutOverCriticalSectionFlag, 1)
 	defer atomic.StoreInt64(&this.migrationContext.InCutOverCriticalSectionFlag, 0)
 
-	okToUnlockTable := make(chan bool, 4)
+	okToDropSentryTable := make(chan bool, 4)
+	okToUnlockTables := make(chan bool, 4)
 	var dropCutOverSentryTableOnce sync.Once
 	defer func() {
-		okToUnlockTable <- true
+		okToDropSentryTable <- true
+		okToUnlockTables <- true
 		dropCutOverSentryTableOnce.Do(func() {
 			this.applier.DropAtomicCutOverSentryTableIfExists()
 		})
@@ -652,8 +654,9 @@ func (this *Migrator) atomicCutOver() (err error) {
 	lockOriginalSessionIdChan := make(chan int64, 2)
 	tableLocked := make(chan error, 2)
 	tableUnlocked := make(chan error, 2)
+	sentryTableDropped := make(chan error, 2)
 	go func() {
-		if err := this.applier.AtomicCutOverMagicLock(lockOriginalSessionIdChan, tableLocked, okToUnlockTable, tableUnlocked, &dropCutOverSentryTableOnce); err != nil {
+		if err := this.applier.AtomicCutOverMagicLock(lockOriginalSessionIdChan, tableLocked, okToDropSentryTable, sentryTableDropped, okToUnlockTables, tableUnlocked, &dropCutOverSentryTableOnce); err != nil {
 			this.migrationContext.Log.Errore(err)
 		}
 	}()
@@ -679,7 +682,8 @@ func (this *Migrator) atomicCutOver() (err error) {
 		if err := this.applier.AtomicCutoverRename(renameSessionIdChan, tablesRenamed); err != nil {
 			// Abort! Release the lock
 			atomic.StoreInt64(&tableRenameKnownToHaveFailed, 1)
-			okToUnlockTable <- true
+			okToDropSentryTable <- true
+			okToUnlockTables <- true
 		}
 	}()
 	renameSessionId := <-renameSessionIdChan
@@ -696,7 +700,8 @@ func (this *Migrator) atomicCutOver() (err error) {
 	// Wait for the RENAME to appear in PROCESSLIST
 	if err := this.retryOperation(waitForRename, true); err != nil {
 		// Abort! Release the lock
-		okToUnlockTable <- true
+		okToDropSentryTable <- true
+		okToUnlockTables <- true
 		return err
 	}
 	if atomic.LoadInt64(&tableRenameKnownToHaveFailed) == 0 {
@@ -709,10 +714,36 @@ func (this *Migrator) atomicCutOver() (err error) {
 	this.migrationContext.Log.Infof("Connection holding lock on original table still exists")
 
 	// Now that we've found the RENAME blocking, AND the locking connection still alive,
-	// we know it is safe to proceed to release the lock
+	// we know it is safe to proceed to drop the magic table.
+	okToDropSentryTable <- true
+	// BAM! magic table dropped.
 
-	okToUnlockTable <- true
-	// BAM! magic table dropped, original table lock is released
+	<-sentryTableDropped
+    // Now that magic table is dropped, we expect that the RENAME thread is waiting for metadata lock on OriginalTable,
+	// and we confirm it.
+	waitForPendingMetadataLock := func() error {
+		if atomic.LoadInt64(&tableRenameKnownToHaveFailed) == 1 {
+			// We return `nil` here so as to avoid the `retry`. The RENAME has failed,
+			// it won't show up in PROCESSLIST, no point in waiting
+			return nil
+		}
+		return this.applier.ExpectMetadataLock(renameSessionId)
+	}
+	// Wait for the RENAME thread PENDING in performance_schema.metadata_locks
+	if err := this.retryOperation(waitForPendingMetadataLock, true); err != nil {
+		// Abort! Release the lock
+		okToDropSentryTable <- true
+		okToUnlockTables <- true
+		return err
+	}
+	if atomic.LoadInt64(&tableRenameKnownToHaveFailed) == 0 {
+		this.migrationContext.Log.Infof("Found atomic RENAME thread Pending on metadata lock of originalTable, as expected.")
+	}
+	// Now that we've found the RENAME Pending on metadata lock of originalTable
+	// we know it is safe to proceed to unlock tables.
+	okToUnlockTables <- true
+
+	//original table lock is released
 	// -> RENAME released -> queries on original are unblocked.
 	if err := <-tableUnlocked; err != nil {
 		return this.migrationContext.Log.Errore(err)

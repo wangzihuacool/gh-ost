@@ -791,6 +791,30 @@ func (this *Applier) ExpectProcess(sessionId int64, stateHint, infoHint string) 
 	return nil
 }
 
+// ExpectMetadataLock expects a PENDING metadata lock on OriginalTable to show up in `performance_schema.metadata_locks` that has given characteristics
+func (this *Applier) ExpectMetadataLock(sessionId int64) error {
+	found := false
+	query := `
+		select /*+ gh-ost */ m.owner_thread_id
+			from performance_schema.metadata_locks m join performance_schema.threads t 
+			on m.owner_thread_id=t.thread_id
+			where m.object_type = 'TABLE' and m.object_schema = ? and m.object_name = ? 
+			and m.lock_type = 'EXCLUSIVE' and m.lock_status = 'PENDING' 
+			and t.processlist_id = ?
+	`
+	err := sqlutils.QueryRowsMap(this.db, query, func(m sqlutils.RowMap) error {
+		found = true
+		return nil
+	}, this.migrationContext.DatabaseName, this.migrationContext.OriginalTableName, sessionId)
+	if err != nil {
+		return err
+	}
+	if !found {
+		return fmt.Errorf("cannot find PENDING metadata lock on original table: `%s`.`%s`", this.migrationContext.DatabaseName, this.migrationContext.OriginalTableName)
+	}
+	return nil
+}
+
 // DropAtomicCutOverSentryTableIfExists checks if the "old" table name
 // happens to be a cut-over magic table; if so, it drops it.
 func (this *Applier) DropAtomicCutOverSentryTableIfExists() error {
@@ -837,7 +861,7 @@ func (this *Applier) CreateAtomicCutOverSentryTable() error {
 }
 
 // AtomicCutOverMagicLock
-func (this *Applier) AtomicCutOverMagicLock(sessionIdChan chan int64, tableLocked chan<- error, okToUnlockTable <-chan bool, tableUnlocked chan<- error, dropCutOverSentryTableOnce *sync.Once) error {
+func (this *Applier) AtomicCutOverMagicLock(sessionIdChan chan int64, tableLocked chan<- error, okToDropSentryTable <-chan bool, sentryTableDropped chan<- error, okToUnlockTables <-chan bool, tableUnlocked chan<- error, dropCutOverSentryTableOnce *sync.Once) error {
 	tx, err := this.db.Begin()
 	if err != nil {
 		tableLocked <- err
@@ -905,8 +929,8 @@ func (this *Applier) AtomicCutOverMagicLock(sessionIdChan chan int64, tableLocke
 
 	// The cut-over phase will proceed to apply remaining backlog onto ghost table,
 	// and issue RENAME. We wait here until told to proceed.
-	<-okToUnlockTable
-	this.migrationContext.Log.Infof("Will now proceed to drop magic table and unlock tables")
+	<-okToDropSentryTable
+	this.migrationContext.Log.Infof("Will now proceed to drop magic table.")
 
 	// The magic table is here because we locked it. And we are the only ones allowed to drop it.
 	// And in fact, we will:
@@ -922,6 +946,13 @@ func (this *Applier) AtomicCutOverMagicLock(sessionIdChan chan int64, tableLocke
 			// We DO NOT return here because we must `UNLOCK TABLES`!
 		}
 	})
+    sentryTableDropped <- nil
+
+	// the magic table was dropped, we wait here until one of the following conditions is met:
+	// 1. the RENAME thread is currently waiting for metadata lock on OriginalTable, and is safe to unlock tables;
+	// 2. the RENAME thread has timeout and exited, we have to release locks.
+	<-okToUnlockTables
+	this.migrationContext.Log.Infof("Will now proceed to unlock tables.")
 
 	// Tables still locked
 	this.migrationContext.Log.Infof("Releasing lock from %s.%s, %s.%s",

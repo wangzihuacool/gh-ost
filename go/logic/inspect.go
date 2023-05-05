@@ -71,6 +71,9 @@ func (this *Inspector) InitDBConnections() (err error) {
 	if err := this.applyBinlogFormat(); err != nil {
 		return err
 	}
+	if err := this.validateMetadataLockInstrument(); err != nil {
+		return err
+	}
 	this.migrationContext.Log.Infof("Inspector initiated on %+v, version %+v", this.connectionConfig.ImpliedKey, this.migrationContext.InspectorMySQLVersion)
 	return nil
 }
@@ -280,6 +283,26 @@ func (this *Inspector) validateGrants() error {
 	}
 	this.migrationContext.Log.Debugf("Privileges: Super: %t, REPLICATION CLIENT: %t, REPLICATION SLAVE: %t, ALL on *.*: %t, ALL on %s.*: %t", foundSuper, foundReplicationClient, foundReplicationSlave, foundAll, sql.EscapeName(this.migrationContext.DatabaseName), foundDBAll)
 	return this.migrationContext.Log.Errorf("User has insufficient privileges for migration. Needed: SUPER|REPLICATION CLIENT, REPLICATION SLAVE and ALL on %s.*", sql.EscapeName(this.migrationContext.DatabaseName))
+}
+
+// validateMetadataLockInstrument verifies metadata lock instrumentation state when atomic cut-over type is chosen.
+func (this *Inspector) validateMetadataLockInstrument() error {
+	if this.migrationContext.CutOverType == base.CutOverTwoStep {
+		return nil
+	}
+	query := `
+	select /*+ gh-ost */ ENABLED, TIMED from performance_schema.setup_instruments
+	WHERE NAME = 'wait/lock/metadata/sql/mdl'
+	`
+	var enabled, timed string
+	if err := this.db.QueryRow(query).Scan(&enabled, &timed); err != nil {
+		return fmt.Errorf("query performance_schema.setup_instruments error: %s", err)
+	}
+	if strings.EqualFold(enabled, "YES") && strings.EqualFold(timed, "YES") {
+		this.migrationContext.Log.Infof("metadata lock instrumentation has been enabled, as expected.")
+		return nil
+	}
+	return fmt.Errorf("metadata lock instrumentation should be enabled when atomic cut-over")
 }
 
 // restartReplication is required so that we are _certain_ the binlog format and
