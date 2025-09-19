@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"strings"
 
 	"github.com/github/gh-ost/go/base"
 	"github.com/github/gh-ost/go/logic"
