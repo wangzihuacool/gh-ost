@@ -1086,6 +1086,9 @@ func (this *Applier) ApplyDMLEventQueries(dmlEvents [](*binlog.BinlogDMLEvent)) 
 			return err
 		}
 
+		// binlog同步依赖项目github.com/siddontang/go-mysql/replication中会将时区默认设置为UTC,这里写入数据时保持跟解析binlog时区一致，从而避免datetime类时间不一致
+		// 不过这里也引入另外一个问题，在使用gh-ost添加时间字段定义为"DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP"时，旧表没有这个时间字段，
+		// applier在往新表中插入时设置了时区UTC，导致改表期间插入的新记录该时间列的时间比CST小8个小时。故而，不建议这个场景使用gh-ost改表。
 		sessionQuery := "SET SESSION time_zone = '+00:00'"
 
 		sqlModeAddendum := `,NO_AUTO_VALUE_ON_ZERO`

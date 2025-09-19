@@ -182,6 +182,9 @@ func main() {
 	if migrationContext.AlterStatement == "" {
 		log.Fatalf("--alter must be provided and statement must not be empty")
 	}
+	if strings.Contains(strings.ToLower(migrationContext.AlterStatement), "current_timestamp") {
+		log.Fatalf("--alter statement contains 'current_timestamp', which is not supported for tables with default current time values")
+	}
 	parser := sql.NewParserFromAlterStatement(migrationContext.AlterStatement)
 	migrationContext.AlterStatementOptions = parser.GetAlterStatementOptions()
 
